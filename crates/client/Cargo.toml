@@ -1,0 +1,56 @@
+# Separate workspace on purpose: the client builds for wasm32 only and must
+# never enter the Vercel (server) build graph.
+[workspace]
+
+[package]
+name = "harness-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "harness-client-dev"
+path = "src/main.rs"
+
+[dependencies]
+harness-core = { path = "../core" }
+leptos = { version = "0.8.23", features = ["csr"] }
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4.50"
+js-sys = "0.3.77"
+serde_json = "1"
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3.77", features = [
+    "AbortController",
+    "AbortSignal",
+    "Clipboard",
+    "CssStyleDeclaration",
+    "Document",
+    "Element",
+    "EventTarget",
+    "Headers",
+    "HtmlElement",
+    "Navigator",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Storage",
+    "TextDecoder",
+    "TextDecodeOptions",
+    "VisualViewport",
+    "Window",
+] }
+
+# Size profile for the packed single-file client. Note: no `strip = true` —
+# wasm-bindgen needs the target_features custom section; wasm-opt (run on the
+# bindgen output by the packer) does the final shrinking.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

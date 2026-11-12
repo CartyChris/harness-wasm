@@ -1,0 +1,12 @@
+# Ignore build output except the release binaries Vercel's Rust runtime needs.
+target/**
+!target/release
+!target/x86_64-unknown-linux-gnu/release/**
+!target/aarch64-unknown-linux-gnu/release/**
+# The wasm client is its own workspace and never builds on Vercel.
+crates/client
+crates/client/**
+scripts
+tests
+node_modules
+.env

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<!-- Trunk dev source. The ship artifact is built by scripts/pack-single-html.mjs
+     into dist/harness.html — this file never ships. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0d10" />
+    <title>Harness</title>
+    <link data-trunk rel="css" href="style.css" />
+  </head>
+  <body>
+    <div id="shell">
+      <div class="boot-topbar">
+        <span class="boot-mark" aria-hidden="true">H</span>
+        <span class="boot-title">Harness</span>
+      </div>
+      <div class="boot-body">
+        <div class="boot-glyph" aria-hidden="true">H</div>
+        <div class="boot-loading">Loading <span class="boot-dots"><span></span><span></span><span></span></span></div>
+      </div>
+      <noscript><p>Harness needs JavaScript enabled — the whole app is WebAssembly.</p></noscript>
+    </div>
+    <div id="init-error" role="alert"></div>
+    <div id="app"></div>
+    <script type="module" src="src/main.rs"></script>
+  </body>
+</html>

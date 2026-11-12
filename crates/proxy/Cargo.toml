@@ -1,0 +1,30 @@
+[package]
+name = "harness-proxy"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "harness_proxy"
+path = "src/lib.rs"
+
+# Local dev server: the same handlers as the Vercel functions, bound to
+# loopback only (never a public interface).
+[[bin]]
+name = "dev-server"
+path = "src/bin/dev_server.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+] }
+url = "2"
+serde_json = "1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio-stream = "0.1"

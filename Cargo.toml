@@ -1,0 +1,47 @@
+[package]
+name = "harness-wasm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Server-side workspace only. crates/client is a separate workspace (wasm32
+# target, Leptos CSR) so Vercel's Rust build never compiles the client; build
+# it with scripts/pack-single-html.mjs (or `cargo build --manifest-path
+# crates/client/Cargo.toml --target wasm32-unknown-unknown --release`).
+[workspace]
+members = ["crates/proxy", "crates/core"]
+
+# Each Vercel function is a [[bin]] (official Vercel Rust runtime layout).
+[[bin]]
+name = "chat"
+path = "api/chat.rs"
+
+[[bin]]
+name = "models"
+path = "api/models.rs"
+
+[[bin]]
+name = "health"
+path = "api/health.rs"
+
+[dependencies]
+harness-proxy = { path = "crates/proxy" }
+vercel_runtime = { version = "2.4.1", features = ["axum"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = "0.5"
+
+[dev-dependencies]
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+] }
+url = "2"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio-stream = "0.1"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
