@@ -31,7 +31,7 @@ scan() {
     while IFS= read -r f; do
         [ -z "$f" ] && continue
         # This script itself contains only the pattern definitions.
-        [ "$f" = "./scripts/secret-grep.sh" ] && continue
+        [ "$(basename "$f")" = "secret-grep.sh" ] && continue
         found=$(grep -HnE "$pattern" "$f" 2>/dev/null || true)
         if [ -n "$found" ]; then
             hits="${hits}${found}"$'\n'
