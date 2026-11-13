@@ -2,8 +2,8 @@
 //! and the harness access token — never an OpenRouter key.
 
 use crate::js;
-use harness_core::sse::{self, SseParser};
-use harness_core::{ChatMessage, Settings};
+use harness_core::sse::{self, ChunkDelta, SseParser};
+use harness_core::Settings;
 use wasm_bindgen::{closure::Closure, JsCast};
 use wasm_bindgen_futures::JsFuture;
 
@@ -35,20 +35,16 @@ fn err_text(err: &wasm_bindgen::JsValue) -> String {
     err.as_string().unwrap_or_default()
 }
 
-/// Stream one chat turn. `on_delta` is called with each token fragment as it
-/// arrives. Returns when the stream ends, is cancelled via `abort`, or fails.
+/// Stream one model step. `on_chunk` is called with each parsed chunk
+/// (text, reasoning, tool-call fragments) as it arrives. Returns when the
+/// stream ends, is cancelled via `abort`, or fails. `body` is the full
+/// OpenAI-compatible request (model, messages, stream, tools).
 pub async fn stream_chat(
     settings: &Settings,
-    model: &str,
-    messages: &[ChatMessage],
-    on_delta: &dyn Fn(&str),
+    body: &serde_json::Value,
+    on_chunk: &dyn Fn(ChunkDelta),
     abort: &web_sys::AbortController,
 ) -> Result<Outcome, NetError> {
-    let body = serde_json::json!({
-        "model": model,
-        "messages": messages,
-        "stream": true,
-    });
     let init = web_sys::RequestInit::new();
     init.set_method("POST");
     init.set_body(&wasm_bindgen::JsValue::from_str(&body.to_string()));
@@ -153,8 +149,8 @@ pub async fn stream_chat(
             if let Some(message) = sse::error_message(&data) {
                 return Err(NetError::Api { status: 200, message });
             }
-            if let Some(delta) = sse::delta_content(&data) {
-                on_delta(&delta);
+            if let Some(chunk) = sse::parse_chunk(&data) {
+                on_chunk(chunk);
             }
         }
     }
@@ -162,8 +158,8 @@ pub async fn stream_chat(
     // Stream ended without [DONE]; flush any trailing event.
     parser.finish(&mut events);
     for data in events {
-        if let Some(delta) = sse::delta_content(&data) {
-            on_delta(&delta);
+        if let Some(chunk) = sse::parse_chunk(&data) {
+            on_chunk(chunk);
         }
     }
     Ok(Outcome::Done)

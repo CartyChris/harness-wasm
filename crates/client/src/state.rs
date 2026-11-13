@@ -1,15 +1,39 @@
-//! Shared app state (one context provided at the root).
+//! Shared app state (one Copy context passed down from the root).
 
 use crate::storage::{self, Boot, NEW_CHAT_TITLE};
-use harness_core::{Message, Session, Settings};
+use harness_core::events::{derive_transcript, EventKind, TranscriptItem};
+use harness_core::permissions::{ApprovalMode, Rules};
+use harness_core::tools::ToolCall;
+use harness_core::{Session, Settings};
 use leptos::prelude::*;
+use std::collections::BTreeSet;
 
-/// One in-flight turn. Only ever zero or one of these.
+/// What the live (in-memory) part of the open turn is doing right now.
+#[derive(Clone, PartialEq)]
+pub enum Phase {
+    /// Streaming a model step.
+    Streaming,
+    /// Waiting for the user to Allow / Deny this call.
+    Approval(ToolCall),
+    /// Executing a browser-side tool.
+    Running(String),
+}
+
+/// The in-flight part of a turn. Settled data lives in the session log; this
+/// holds only what is not durable yet (stream text, abort handle).
 #[derive(Clone)]
-pub struct Turn {
+pub struct LiveTurn {
     pub session_id: String,
-    pub message_id: String,
-    pub abort: web_sys::AbortController,
+    pub turn: String,
+    pub step: u32,
+    pub phase: Phase,
+    pub text: String,
+    pub reasoning_chars: usize,
+    pub tool_name: Option<String>,
+    pub abort: Option<web_sys::AbortController>,
+    /// Set by Pause before aborting so the driver settles as Paused, not
+    /// Cancelled.
+    pub pause_requested: bool,
 }
 
 /// An artifact opened in the bottom sheet. Model HTML renders only inside a
@@ -20,47 +44,76 @@ pub enum Artifact {
     Html { title: String, body: String },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct AppCtx {
     pub sessions: RwSignal<Vec<Session>>,
     pub current_id: RwSignal<String>,
     pub settings: RwSignal<Settings>,
     /// Locked model — what every request sends.
     pub model: RwSignal<String>,
-    pub turn: RwSignal<Option<Turn>>,
+    /// codex-style approval mode.
+    pub mode: RwSignal<ApprovalMode>,
+    /// opencode-style per-tool rules.
+    pub rules: RwSignal<Rules>,
+    pub tools_enabled: RwSignal<bool>,
+    pub live: RwSignal<Option<LiveTurn>>,
     pub drawer_open: RwSignal<bool>,
     pub settings_open: RwSignal<bool>,
+    pub context_open: RwSignal<bool>,
+    pub log_open: RwSignal<bool>,
+    pub mode_menu_open: RwSignal<bool>,
     pub artifact: RwSignal<Option<Artifact>>,
     pub storage_error: RwSignal<Option<String>>,
-    /// Boot notes (migration notice, storage read failures).
+    /// Boot notes (migration notice, reload recovery, storage read failures).
     pub notes: RwSignal<Vec<String>>,
+    pub draft: RwSignal<String>,
+    /// Expanded timeline cards, by tool-call id.
+    pub expanded: RwSignal<BTreeSet<String>>,
+    /// Thread is scrolled to (near) the bottom: new tokens keep it there.
+    pub pinned: RwSignal<bool>,
+    pub transcript: Memo<Vec<TranscriptItem>>,
 }
 
 impl AppCtx {
     pub fn new(boot: Boot) -> Self {
         let mut sessions = boot.sessions;
         if sessions.is_empty() {
-            sessions.push(Session {
-                id: storage::uid("s"),
-                title: NEW_CHAT_TITLE.to_string(),
-                updated_at: storage::now_ms(),
-                messages: Vec::new(),
-            });
+            sessions.push(Session::new(storage::uid("s"), NEW_CHAT_TITLE.to_string(), storage::now_ms()));
         }
         let current_id = sessions[0].id.clone();
-        let ctx = Self {
-            sessions: RwSignal::new(sessions),
-            current_id: RwSignal::new(current_id),
+        let sessions = RwSignal::new(sessions);
+        let current_id = RwSignal::new(current_id);
+        let transcript = Memo::new(move |_| {
+            let id = current_id.get();
+            sessions.with(|all| {
+                all.iter()
+                    .find(|s| s.id == id)
+                    .map(|s| derive_transcript(&s.events))
+                    .unwrap_or_default()
+            })
+        });
+        Self {
+            sessions,
+            current_id,
             settings: RwSignal::new(boot.settings),
             model: RwSignal::new(boot.model),
-            turn: RwSignal::new(None),
+            mode: RwSignal::new(boot.mode),
+            rules: RwSignal::new(boot.rules),
+            tools_enabled: RwSignal::new(boot.tools_enabled),
+            live: RwSignal::new(None),
             drawer_open: RwSignal::new(false),
             settings_open: RwSignal::new(false),
+            context_open: RwSignal::new(false),
+            log_open: RwSignal::new(false),
+            mode_menu_open: RwSignal::new(false),
             artifact: RwSignal::new(None),
             storage_error: RwSignal::new(None),
             notes: RwSignal::new(boot.notes),
-        };
-        ctx
+            draft: RwSignal::new(String::new()),
+            expanded: RwSignal::new(BTreeSet::new()),
+            pinned: RwSignal::new(true),
+            transcript,
+        }
     }
 
     /// Reactive: reads the settings signal so the banner clears as soon as
@@ -69,31 +122,38 @@ impl AppCtx {
         let settings = self.settings.get();
         settings.base_url.trim().is_empty() && settings.token.is_empty()
     }
-}
 
-/// Find the live message for a view that re-renders on any session change.
-pub fn find_message(ctx: &AppCtx, session_id: &str, message_id: &str) -> Option<Message> {
-    ctx.sessions
-        .get()
-        .iter()
-        .find(|s| s.id == session_id)
-        .and_then(|s| s.messages.iter().find(|m| m.id == message_id))
-        .cloned()
+    /// True while a turn is live in *this* session (streaming, approving, or
+    /// running a tool).
+    pub fn busy(&self) -> bool {
+        self.live.with(|l| l.is_some())
+    }
+
+    pub fn live_in_current(&self) -> Option<LiveTurn> {
+        let id = self.current_id.get();
+        self.live.get().filter(|l| l.session_id == id)
+    }
 }
 
 pub fn current_session(ctx: &AppCtx) -> Session {
-    let sessions = ctx.sessions.get();
     let id = ctx.current_id.get();
-    sessions
-        .iter()
-        .find(|s| s.id == id)
-        .cloned()
-        .unwrap_or_else(|| Session {
-            id: id.clone(),
-            title: NEW_CHAT_TITLE.to_string(),
-            updated_at: storage::now_ms(),
-            messages: Vec::new(),
-        })
+    ctx.sessions.with(|sessions| {
+        sessions
+            .iter()
+            .find(|s| s.id == id)
+            .cloned()
+            .unwrap_or_else(|| Session::new(id.clone(), NEW_CHAT_TITLE.to_string(), storage::now_ms()))
+    })
+}
+
+pub fn session_events(ctx: &AppCtx, session_id: &str) -> Vec<harness_core::events::Event> {
+    ctx.sessions.with_untracked(|sessions| {
+        sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.events.clone())
+            .unwrap_or_default()
+    })
 }
 
 pub fn with_session(ctx: &AppCtx, session_id: &str, f: impl FnOnce(&mut Session)) {
@@ -103,4 +163,14 @@ pub fn with_session(ctx: &AppCtx, session_id: &str, f: impl FnOnce(&mut Session)
             session.updated_at = storage::now_ms();
         }
     });
+}
+
+/// Append one durable event and persist. The only write path into a log.
+pub fn append_event(ctx: &AppCtx, session_id: &str, kind: EventKind) -> u64 {
+    let mut seq = 0;
+    with_session(ctx, session_id, |session| {
+        seq = session.append(kind, storage::now_ms());
+    });
+    storage::save_sessions(ctx);
+    seq
 }

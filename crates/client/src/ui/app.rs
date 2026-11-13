@@ -6,7 +6,9 @@ use crate::state::{current_session, AppCtx};
 use crate::storage;
 use crate::ui::artifact::ArtifactSheet;
 use crate::ui::composer::Composer;
-use crate::ui::drawer::SessionDrawer;
+use crate::ui::context_sheet::ContextSheet;
+use crate::ui::drawer::{new_session, SessionDrawer};
+use crate::ui::log_sheet::LogSheet;
 use crate::ui::settings_sheet::SettingsSheet;
 use crate::ui::thread::Thread;
 use leptos::prelude::*;
@@ -14,6 +16,7 @@ use wasm_bindgen::JsCast;
 
 pub fn mount() {
     js::setup_viewport_tracking();
+    js::setup_pagehide_tracking();
 
     let document = js::document();
     // The boot shell's job is done once WASM boots: remove it so no stale
@@ -43,81 +46,59 @@ pub fn mount() {
 pub fn App() -> impl IntoView {
     let boot = storage::boot();
     let ctx = AppCtx::new(boot);
-    provide_context(ctx.clone());
+    provide_context(ctx);
 
-    // Keep the latest message in view while streaming.
-    let scroll_ctx = ctx.clone();
+    // Keep the latest output in view while streaming — only while the
+    // reader is pinned to the bottom (tokens land without yanking).
     Effect::new(move |_| {
-        let session = current_session(&scroll_ctx);
-        let _content_len = session.messages.last().map(|m| m.content.len());
-        js::schedule_scroll_to_bottom();
+        ctx.transcript.track();
+        ctx.live.with(|l| l.as_ref().map(|l| l.text.len()));
+        js::schedule_scroll_to_bottom(&ctx);
+    });
+    // Switching sessions always lands at the latest message.
+    Effect::new(move |_| {
+        ctx.current_id.track();
+        ctx.pinned.set(true);
+        js::schedule_scroll_to_bottom(&ctx);
     });
 
-    let title_ctx = ctx.clone();
-    let title = move || current_session(&title_ctx).title;
-    let model_ctx = ctx.clone();
-    let model = move || model_ctx.model.get();
-    let streaming_ctx = ctx.clone();
-    let streaming = move || streaming_ctx.turn.get().is_some();
-    let connect_ctx = ctx.clone();
-    let needs_connect = move || connect_ctx.connected_hint_needed();
+    let title = move || current_session(&ctx).title;
+    let model = move || {
+        let m = ctx.model.get();
+        m.rsplit('/').next().unwrap_or(&m).to_string()
+    };
+    let busy = move || ctx.live.with(|l| l.is_some());
+    let needs_connect = move || ctx.connected_hint_needed();
     let storage_error = move || ctx.storage_error.get();
     let notes = move || ctx.notes.get();
 
-    let open_drawer = {
-        let ctx = ctx.clone();
-        move |_| ctx.drawer_open.set(true)
-    };
-    let open_settings = {
-        let ctx = ctx.clone();
-        move |_| ctx.settings_open.set(true)
-    };
-    let open_settings_from_banner = {
-        let ctx = ctx.clone();
-        move |_| ctx.settings_open.set(true)
-    };
-    let dismiss_notes = {
-        let ctx = ctx.clone();
-        move |_| ctx.notes.update(|n| n.clear())
-    };
-
-    let drawer_ctx = ctx.clone();
-    let drawer_slot = move || {
-        drawer_ctx
-            .drawer_open
-            .get()
-            .then(|| view! { <SessionDrawer ctx=drawer_ctx.clone() /> })
-    };
-    let settings_ctx = ctx.clone();
-    let settings_slot = move || {
-        settings_ctx
-            .settings_open
-            .get()
-            .then(|| view! { <SettingsSheet ctx=settings_ctx.clone() /> })
-    };
-    let artifact_ctx = ctx.clone();
-    let artifact_slot = move || {
-        artifact_ctx
-            .artifact
-            .get()
-            .map(|artifact| view! { <ArtifactSheet ctx=artifact_ctx.clone() artifact /> })
-    };
+    let drawer_slot = move || ctx.drawer_open.get().then(|| view! { <SessionDrawer ctx=ctx /> });
+    let settings_slot = move || ctx.settings_open.get().then(|| view! { <SettingsSheet ctx=ctx /> });
+    let context_slot = move || ctx.context_open.get().then(|| view! { <ContextSheet ctx=ctx /> });
+    let log_slot = move || ctx.log_open.get().then(|| view! { <LogSheet ctx=ctx /> });
+    let artifact_slot = move || ctx.artifact.get().map(|artifact| view! { <ArtifactSheet ctx=ctx artifact /> });
 
     view! {
-        <div class="app" class:is-streaming=streaming>
+        <div class="app" class:is-streaming=busy>
             <header class="topbar">
-                <button class="icon-btn" aria-label="Sessions" on:click=open_drawer>
+                <button class="icon-btn ghost" aria-label="Sessions" on:click=move |_| ctx.drawer_open.set(true)>
                     <span class="icon-menu" aria-hidden="true"></span>
                 </button>
-                <div class="topbar-title" aria-live="polite">{title}</div>
-                <button class="model-chip" aria-label="Model and connection settings" on:click=open_settings>
-                    <span class="chip-dot" aria-hidden="true"></span>
-                    {model}
+                <button class="model-chip" aria-label="Model and connection settings" on:click=move |_| ctx.settings_open.set(true)>
+                    <span class="topbar-title" aria-live="polite">{title}</span>
+                    <span class="model-line">
+                        <span class="chip-dot" class:is-live=busy aria-hidden="true"></span>
+                        <span class="model-name">{model}</span>
+                        <span class="chev" aria-hidden="true"></span>
+                    </span>
+                </button>
+                <button class="icon-btn ghost" aria-label="New chat" on:click=move |_| new_session(&ctx)>
+                    <span class="icon-new" aria-hidden="true"></span>
                 </button>
             </header>
 
             <Show when=needs_connect>
-                <button class="banner banner-connect" on:click=open_settings_from_banner>
+                <button class="banner banner-connect" on:click=move |_| ctx.settings_open.set(true)>
                     "No proxy connected — tap to set the proxy URL and access token."
                 </button>
             </Show>
@@ -131,17 +112,19 @@ pub fn App() -> impl IntoView {
                     <ul>
                         {move || notes().into_iter().map(|n| view! { <li>{n}</li> }).collect::<Vec<_>>()}
                     </ul>
-                    <button class="mini-btn" on:click=dismiss_notes>"Dismiss"</button>
+                    <button class="mini-btn" on:click=move |_| ctx.notes.update(|n| n.clear())>"Dismiss"</button>
                 </div>
             </Show>
 
-            <Thread ctx=ctx.clone() />
-            <Composer ctx=ctx.clone() />
+            <Thread ctx=ctx />
+            <Composer ctx=ctx />
         </div>
 
         // Overlays unmount fully on close (DESIGN.md §7).
         {drawer_slot}
         {settings_slot}
+        {context_slot}
+        {log_slot}
         {artifact_slot}
     }
 }

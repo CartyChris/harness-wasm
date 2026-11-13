@@ -17,6 +17,13 @@ cargo test --workspace
 echo "== pack checks (size, node --check, single-file, CSS gates) =="
 node --test tests/pack.test.mjs
 
+echo "== e2e (headless Chromium, mock proxy, 390x844) =="
+if [ "${HARNESS_E2E:-1}" != "0" ] && command -v google-chrome >/dev/null 2>&1 && node tests/e2e/run.mjs --probe >/dev/null 2>&1; then
+    node tests/e2e/run.mjs
+else
+    echo "e2e: SKIPPED (no Chromium/playwright on this host, or HARNESS_E2E=0)"
+fi
+
 echo "== secret grep =="
 scripts/secret-grep.sh
 

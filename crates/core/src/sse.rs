@@ -114,6 +114,47 @@ pub fn error_message(data: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Everything one streamed chunk can carry.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChunkDelta {
+    pub content: Option<String>,
+    /// Reasoning / thinking text some models stream before the answer.
+    pub reasoning: Option<String>,
+    pub tool_calls: Vec<crate::tools::ToolCallFragment>,
+    pub finish_reason: Option<String>,
+}
+
+/// Parse one OpenRouter SSE `data:` payload (streaming chat chunk).
+pub fn parse_chunk(data: &str) -> Option<ChunkDelta> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let choice = value.get("choices")?.get(0)?;
+    let mut out = ChunkDelta {
+        content: delta_content(data),
+        finish_reason: choice.get("finish_reason").and_then(|f| f.as_str()).map(str::to_string),
+        ..Default::default()
+    };
+    if let Some(delta) = choice.get("delta") {
+        out.reasoning = delta
+            .get("reasoning")
+            .or_else(|| delta.get("reasoning_content"))
+            .and_then(|r| r.as_str())
+            .filter(|r| !r.is_empty())
+            .map(str::to_string);
+        if let Some(calls) = delta.get("tool_calls").and_then(|c| c.as_array()) {
+            for (pos, call) in calls.iter().enumerate() {
+                let function = call.get("function");
+                out.tool_calls.push(crate::tools::ToolCallFragment {
+                    index: call.get("index").and_then(|i| i.as_u64()).map(|i| i as usize).unwrap_or(pos),
+                    id: call.get("id").and_then(|v| v.as_str()).map(str::to_string),
+                    name: function.and_then(|f| f.get("name")).and_then(|v| v.as_str()).map(str::to_string),
+                    arguments: function.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).map(str::to_string),
+                });
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Model ids from a `/api/models` JSON body.
 pub fn model_ids(models_json: &str) -> Option<Vec<String>> {
     let value: serde_json::Value = serde_json::from_str(models_json).ok()?;
@@ -223,5 +264,18 @@ mod tests {
             Some(vec!["x-ai/grok-4.7".to_string(), "openai/gpt-4o-mini".to_string()])
         );
         assert_eq!(model_ids(r#"{"nope":1}"#), None);
+    }
+
+    #[test]
+    fn parse_chunk_reads_tool_call_fragments() {
+        let d = parse_chunk(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write_file","arguments":"{\"pa"}}]},"finish_reason":null}]}"#).unwrap();
+        assert_eq!(d.tool_calls.len(), 1);
+        assert_eq!(d.tool_calls[0].name.as_deref(), Some("write_file"));
+        assert_eq!(d.tool_calls[0].arguments.as_deref(), Some("{\"pa"));
+        let end = parse_chunk(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#).unwrap();
+        assert_eq!(end.finish_reason.as_deref(), Some("tool_calls"));
+        let r = parse_chunk(r#"{"choices":[{"delta":{"reasoning":"hmm","content":""}}]}"#).unwrap();
+        assert_eq!(r.reasoning.as_deref(), Some("hmm"));
+        assert_eq!(parse_chunk("[DONE]"), None);
     }
 }

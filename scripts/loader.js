@@ -68,7 +68,7 @@
           ' bytes but decoded ' + bytes.length + '.'
       );
     }
-    return wasm_bindgen(bytes).then(function () {
+    return wasm_bindgen({ module_or_path: bytes }).then(function () {
       if (typeof wasm_bindgen.run_app !== 'function') {
         throw new Error('The WASM module has no run_app export.');
       }

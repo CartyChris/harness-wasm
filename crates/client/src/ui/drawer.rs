@@ -18,19 +18,7 @@ pub fn SessionDrawer(ctx: AppCtx) -> impl IntoView {
 
     let new_session = {
         let ctx = ctx.clone();
-        move |_| {
-            let session = Session {
-                id: storage::uid("s"),
-                title: storage::NEW_CHAT_TITLE.to_string(),
-                updated_at: storage::now_ms(),
-                messages: Vec::new(),
-            };
-            let id = session.id.clone();
-            ctx.sessions.update(|sessions| sessions.insert(0, session));
-            ctx.current_id.set(id);
-            storage::save_sessions(&ctx);
-            ctx.drawer_open.set(false);
-        }
+        move |_| new_session(&ctx)
     };
 
     let list_ctx = ctx.clone();
@@ -64,6 +52,25 @@ pub fn SessionDrawer(ctx: AppCtx) -> impl IntoView {
             </aside>
         </div>
     }
+}
+
+/// New empty session, made current. Reuses an existing empty one at the top
+/// instead of stacking blank chats.
+pub fn new_session(ctx: &AppCtx) {
+    let reuse = ctx.sessions.with_untracked(|s| s.first().filter(|s| s.events.is_empty()).map(|s| s.id.clone()));
+    let id = match reuse {
+        Some(id) => id,
+        None => {
+            let session = Session::new(storage::uid("s"), storage::NEW_CHAT_TITLE.to_string(), storage::now_ms());
+            let id = session.id.clone();
+            ctx.sessions.update(|sessions| sessions.insert(0, session));
+            id
+        }
+    };
+    ctx.current_id.set(id);
+    ctx.pinned.set(true);
+    storage::save_sessions(ctx);
+    ctx.drawer_open.set(false);
 }
 
 #[component]
@@ -125,7 +132,12 @@ fn SessionRow(
     // One reactive slot: the open button, or the inline rename input. Fresh
     // closures per evaluation (signals clone cheaply).
     let title = session.title.clone();
-    let message_count = session.messages.len();
+    let message_count = session
+        .events
+        .iter()
+        .filter(|e| matches!(e.kind, harness_core::events::EventKind::UserMessage { .. }))
+        .count();
+    let event_count = session.events.len();
     let edit_slot = {
         let ctx = ctx.clone();
         let session_id = session.id.clone();
@@ -178,7 +190,7 @@ fn SessionRow(
                 view! {
                     <button class="session-open" on:click=open>
                         <span class="session-title">{title.clone()}</span>
-                        <span class="session-meta">{message_count} " msgs"</span>
+                        <span class="session-meta">{message_count} " messages · " {event_count} " events"</span>
                     </button>
                 }
                 .into_any()
@@ -231,12 +243,7 @@ fn delete_session(ctx: &AppCtx, session_id: &str) {
         match next {
             Some(id) => ctx.current_id.set(id),
             None => {
-                let session = Session {
-                    id: storage::uid("s"),
-                    title: storage::NEW_CHAT_TITLE.to_string(),
-                    updated_at: storage::now_ms(),
-                    messages: Vec::new(),
-                };
+                let session = Session::new(storage::uid("s"), storage::NEW_CHAT_TITLE.to_string(), storage::now_ms());
                 let id = session.id.clone();
                 ctx.sessions.update(|sessions| sessions.push(session));
                 ctx.current_id.set(id);

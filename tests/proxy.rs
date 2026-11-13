@@ -39,6 +39,7 @@ struct RecordedHit {
     path: String,
     authorization: String,
     body_len: usize,
+    body: String,
 }
 
 async fn spawn_mock(state: MockState) -> url::Url {
@@ -60,6 +61,7 @@ async fn spawn_mock(state: MockState) -> url::Url {
                         .unwrap_or_default()
                         .to_string(),
                     body_len: bytes.len(),
+                    body: String::from_utf8_lossy(&bytes).to_string(),
                 });
                 match st.chat {
                     ChatBehavior::Sse { ref chunks, delay } => {
@@ -102,6 +104,7 @@ async fn spawn_mock(state: MockState) -> url::Url {
                         .unwrap_or_default()
                         .to_string(),
                     body_len: 0,
+                    body: String::new(),
                 });
                 Response::builder()
                     .status(StatusCode::OK)
@@ -525,4 +528,46 @@ async fn options_preflight_succeeds_without_auth() {
         .unwrap();
     assert!(allow.to_lowercase().contains("authorization"));
     assert!(allow.to_lowercase().contains("content-type"));
+}
+
+// --- Stage 3: agent tool loop passthrough (codex / OpenHands pattern) ----------
+
+/// The client's tool loop needs `tools`, `tool_choice`, assistant
+/// `tool_calls` and `role:"tool"` messages to reach OpenRouter byte-for-byte,
+/// and streamed `tool_calls` deltas to come back untouched.
+#[tokio::test]
+async fn tool_loop_payload_and_tool_call_deltas_pass_through_intact() {
+    let tool_delta = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",",
+        "\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n"
+    )
+    .to_string();
+    let finish = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n".to_string();
+    let state = MockState {
+        hits: Arc::new(Mutex::new(Vec::new())),
+        chat: ChatBehavior::Sse { chunks: vec![tool_delta.clone(), finish.clone()], delay: Duration::from_millis(5) },
+    };
+    let base = spawn_mock(state.clone()).await;
+    let app = full_router(test_config(base));
+
+    let body = concat!(
+        r#"{"model":"x-ai/grok-4.7","stream":true,"tool_choice":"auto","#,
+        r#""tools":[{"type":"function","function":{"name":"write_file","description":"Create or overwrite a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}],"#,
+        r#""messages":[{"role":"system","content":"You are Harness."},{"role":"user","content":"make index.html"},"#,
+        r#"{"role":"assistant","content":"","tool_calls":[{"id":"call_0","type":"function","function":{"name":"list_files","arguments":"{}"}}]},"#,
+        r#"{"role":"tool","tool_call_id":"call_0","content":"(empty workspace)"}]}"#
+    );
+    let response = app.oneshot(post_chat(body, Some(GATE_TOKEN))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let streamed = body_string(response.into_body()).await;
+    assert_eq!(streamed, format!("{tool_delta}{finish}"), "SSE tool_call deltas must be relayed verbatim");
+
+    let hits = state.hits.lock().unwrap().clone();
+    let chat_hit = hits.iter().find(|h| h.path == "/api/v1/chat/completions").expect("upstream hit");
+    assert_eq!(chat_hit.body, body, "tool loop request must reach upstream byte-for-byte");
+    assert_eq!(chat_hit.body_len, body.len());
+    assert!(chat_hit.body.contains("\"model\":\"x-ai/grok-4.7\""));
+    // The upstream key is attached server-side only, never in the body.
+    assert!(!chat_hit.body.contains("sk-or-"));
+    assert_eq!(chat_hit.authorization, format!("Bearer {}", fake_upstream_key()));
 }

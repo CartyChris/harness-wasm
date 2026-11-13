@@ -1,192 +1,229 @@
-//! Thread transcript. Assistant text renders ONLY as escaped text nodes and
-//! created elements (DESIGN.md §6): no `innerHTML`, ever. Fenced code becomes
-//! a code card; tapping it opens the artifact sheet.
+//! Thread: the transcript derived from the session's append-only log, plus
+//! the live (not yet durable) tail of the open turn. Assistant text renders
+//! through the safe Markdown AST only — no `innerHTML`, ever (DESIGN.md §6).
 
 use crate::agent;
-use crate::state::{current_session, find_message, AppCtx, Artifact};
-use harness_core::Message;
+use crate::state::{current_session, AppCtx, LiveTurn, Phase};
+use crate::ui::md::render_markdown;
+use crate::ui::timeline::tool_card;
+use harness_core::events::{retryable_turn, StepItem, TranscriptItem, TurnStatus, TurnView};
 use leptos::prelude::*;
+
+const SUGGESTIONS: [(&str, &str); 4] = [
+    ("Build a tip calculator", "Build a single-file HTML tip calculator in the workspace (index.html), then summarize it."),
+    ("Write a Rust function", "Write src/lib.rs with a function that checks if a string is a palindrome, plus a unit test."),
+    ("Explain this harness", "In a few bullets: what can you do in this harness, and how do approvals and undo work?"),
+    ("Plan a weekend trip", "Give me a short 2-day plan for a weekend in Montreal, as a table."),
+];
 
 #[component]
 pub fn Thread(ctx: AppCtx) -> impl IntoView {
-    let each_ctx = ctx.clone();
-    let empty_ctx = ctx.clone();
+    let keys = Memo::new(move |_| ctx.transcript.with(|t| t.iter().map(|i| i.key()).collect::<Vec<_>>()));
+    let empty = move || ctx.transcript.with(|t| t.is_empty()) && ctx.live_in_current().is_none();
+    let on_scroll = move |_| {
+        let pinned = crate::js::thread_distance_from_bottom() < 96;
+        if ctx.pinned.get_untracked() != pinned {
+            ctx.pinned.set(pinned);
+        }
+    };
 
     view! {
-        <main class="thread" id="thread">
-            <For
-                each=move || current_session(&each_ctx).messages
-                key=|message| message.id.clone()
-                let(message)
-            >
-                <MessageView ctx=ctx.clone() message_id=message.id.clone() />
-            </For>
-            <Show when=move || current_session(&empty_ctx).messages.is_empty()>
-                <div class="empty-state">
-                    <div class="empty-mark" aria-hidden="true">"◇"</div>
-                    <p class="empty-title">"Harness"</p>
-                    <p class="empty-hint">"Streaming chat through your proxy. Locked model, session memory, artifacts."</p>
-                </div>
+        <main class="thread" id="thread" on:scroll=on_scroll>
+            <div class="thread-inner">
+                <For each=move || keys.get() key=|k| k.clone() let(key)>
+                    <ItemView ctx=ctx item_key=key />
+                </For>
+            </div>
+            <Show when=empty>
+                <EmptyState ctx=ctx />
             </Show>
         </main>
     }
 }
 
 #[component]
-fn MessageView(ctx: AppCtx, message_id: String) -> impl IntoView {
-    let kind = {
-        let ctx = ctx.clone();
-        let message_id = message_id.clone();
-        move || {
-            find_message(&ctx, &ctx.current_id.get(), &message_id)
-                .map(|m| if m.is_user() { "user" } else { "assistant" })
-                .unwrap_or("assistant")
-                .to_string()
-        }
-    };
-    let body = {
-        let ctx = ctx.clone();
-        let message_id = message_id.clone();
-        move || {
-            find_message(&ctx, &ctx.current_id.get(), &message_id)
-                .map(|m| render_body(ctx.clone(), &m))
-                .unwrap_or_default()
-        }
-    };
-    let meta = {
-        let ctx = ctx.clone();
-        let message_id = message_id.clone();
-        move || {
-            find_message(&ctx, &ctx.current_id.get(), &message_id)
-                .map(|m| render_meta(ctx.clone(), &m))
-                .unwrap_or_default()
-        }
-    };
-
+fn EmptyState(ctx: AppCtx) -> impl IntoView {
+    let chips: Vec<AnyView> = SUGGESTIONS
+        .iter()
+        .map(|(label, prompt)| {
+            let prompt = prompt.to_string();
+            view! {
+                <button class="suggest" on:click=move |_| agent::send(&ctx, prompt.clone())>
+                    <span class="suggest-label">{*label}</span>
+                    <span class="suggest-arrow" aria-hidden="true">"↗"</span>
+                </button>
+            }
+            .into_any()
+        })
+        .collect();
     view! {
-        <article class=move || format!("msg msg-{}", kind())>
-            <div class="bubble">
-                <div class="msg-body">{body}</div>
-                {meta}
-            </div>
-        </article>
+        <div class="empty-state">
+            <div class="empty-mark" aria-hidden="true"><span></span></div>
+            <p class="empty-title">"What should we build?"</p>
+            <p class="empty-hint">"Streams through your proxy. Tools run in a phone-local workspace — you approve every write."</p>
+            <div class="suggest-list">{chips}</div>
+        </div>
     }
 }
 
-/// Status line under a message: streaming pulse, failure reason + Retry.
-fn render_meta(ctx: AppCtx, message: &Message) -> Vec<AnyView> {
-    let mut out = Vec::new();
-    match message.status.as_str() {
-        "Streaming" => out.push(
-            view! {
-                <div class="msg-status"><span class="pulse" aria-hidden="true"></span>"streaming…"</div>
+#[component]
+fn ItemView(ctx: AppCtx, item_key: String) -> impl IntoView {
+    let item = Memo::new(move |_| ctx.transcript.with(|t| t.iter().find(|i| i.key() == item_key).cloned()));
+    move || {
+        item.get().map(|it| match it {
+            TranscriptItem::User { text, .. } => view! {
+                <article class="msg msg-user">
+                    <div class="bubble"><p class="msg-text">{text}</p></div>
+                </article>
             }
             .into_any(),
-        ),
-        "Interrupted" | "Cancelled" => {
-            let reason = message.error.clone().unwrap_or_else(|| {
-                "Turn interrupted — partial text kept.".to_string()
-            });
-            out.push(view! { <div class="msg-status msg-status-warn">{reason}</div> }.into_any());
-            out.push(retry_button(ctx));
-        }
-        "Failed" => {
-            let reason = message
-                .error
-                .clone()
-                .unwrap_or_else(|| "The turn failed.".to_string());
-            out.push(view! { <div class="msg-status msg-status-err">{reason}</div> }.into_any());
-            out.push(retry_button(ctx));
-        }
-        _ => {}
+            TranscriptItem::Note { text, .. } => view! {
+                <div class="note" role="status"><span class="note-glyph" aria-hidden="true">"↶"</span>{text}</div>
+            }
+            .into_any(),
+            TranscriptItem::Turn(turn) => turn_view(ctx, turn),
+        })
     }
+}
+
+fn group_items(ctx: AppCtx, turn: &TurnView) -> Vec<AnyView> {
+    let mut out = Vec::new();
+    let mut tools: Vec<AnyView> = Vec::new();
+    let flush = |tools: &mut Vec<AnyView>, out: &mut Vec<AnyView>| {
+        if !tools.is_empty() {
+            let cards = std::mem::take(tools);
+            out.push(view! { <div class="timeline">{cards}</div> }.into_any());
+        }
+    };
+    for item in &turn.items {
+        match item {
+            StepItem::Text { text, .. } => {
+                flush(&mut tools, &mut out);
+                out.push(render_markdown(ctx, text));
+            }
+            StepItem::Tool(v) => tools.push(tool_card(ctx, turn.turn.clone(), v.clone())),
+        }
+    }
+    flush(&mut tools, &mut out);
     out
 }
 
-fn retry_button(ctx: AppCtx) -> AnyView {
+fn live_view(ctx: AppCtx, live: LiveTurn) -> AnyView {
+    match live.phase {
+        Phase::Streaming => {
+            let status = if let Some(name) = &live.tool_name {
+                Some(format!("Calling {name}…"))
+            } else if live.text.is_empty() && live.reasoning_chars > 0 {
+                Some("Thinking…".to_string())
+            } else if live.text.is_empty() {
+                Some(String::new())
+            } else {
+                None
+            };
+            view! {
+                <div class="live" class:has-text=!live.text.is_empty()>
+                    {(!live.text.is_empty()).then(|| render_markdown(ctx, &live.text))}
+                    {status.map(|s| view! {
+                        <div class="live-status" role="status">
+                            <span class="typing" aria-hidden="true"><span></span><span></span><span></span></span>
+                            {(!s.is_empty()).then(|| view! { <span class="live-label">{s.clone()}</span> })}
+                        </div>
+                    })}
+                </div>
+            }
+            .into_any()
+        }
+        Phase::Running(name) => view! {
+            <div class="live-status" role="status">
+                <span class="typing" aria-hidden="true"><span></span><span></span><span></span></span>
+                <span class="live-label">{format!("Running {name}…")}</span>
+            </div>
+        }
+        .into_any(),
+        Phase::Approval(_) => ().into_any(),
+    }
+}
+
+fn turn_view(ctx: AppCtx, turn: TurnView) -> AnyView {
+    let body = group_items(ctx, &turn);
+    let turn_id = turn.turn.clone();
+    let live_tail = {
+        let turn_id = turn_id.clone();
+        move || ctx.live.get().filter(|l| l.turn == turn_id).map(|l| live_view(ctx, l))
+    };
+    let can_retry = {
+        let turn_id = turn_id.clone();
+        Memo::new(move |_| ctx.live.with(|l| l.is_none()) && retryable_turn(&current_session(&ctx).events).as_deref() == Some(turn_id.as_str()))
+    };
+    let retry_btn = move || {
+        can_retry.get().then(|| view! {
+            <button class="mini-btn retry-btn" on:click=move |_| agent::retry(&ctx)>"↻ Retry"</button>
+        })
+    };
+    let model_short = turn.model.rsplit('/').next().unwrap_or(&turn.model).to_string();
+    let tools_n = turn.tool_count();
+    let meta = {
+        let mut parts = vec![model_short];
+        if turn.steps > 1 {
+            parts.push(format!("{} steps", turn.steps));
+        }
+        if tools_n > 0 {
+            parts.push(format!("{tools_n} tool{}", if tools_n == 1 { "" } else { "s" }));
+        }
+        parts.push(turn.mode.label().to_string());
+        parts.join(" · ")
+    };
+    let empty_done = turn.items.is_empty() && turn.status == TurnStatus::Done;
+    let footer = match turn.status.clone() {
+        TurnStatus::Running => ().into_any(),
+        TurnStatus::Paused { reason } => view! {
+            <div class="turn-foot">
+                <div class="turn-status is-paused"><span class="pause-glyph" aria-hidden="true"></span>{format!("Paused · {reason}")}</div>
+                <button class="mini-btn resume-btn" on:click=move |_| agent::resume(&ctx)>"▶ Resume"</button>
+            </div>
+        }
+        .into_any(),
+        TurnStatus::Done => view! {
+            <div class="turn-foot">
+                {empty_done.then(|| view! { <div class="turn-status">"(no reply text)"</div> })}
+                <div class="turn-meta">{meta.clone()}</div>
+            </div>
+        }
+        .into_any(),
+        TurnStatus::Cancelled => view! {
+            <div class="turn-foot">
+                <div class="turn-status is-warn">"Stopped — partial reply kept."</div>
+                {retry_btn}
+            </div>
+        }
+        .into_any(),
+        TurnStatus::Interrupted { reason } => view! {
+            <div class="turn-foot">
+                <div class="turn-status is-warn">{reason}</div>
+                {retry_btn}
+            </div>
+        }
+        .into_any(),
+        TurnStatus::Failed { reason } => view! {
+            <div class="turn-foot">
+                <div class="turn-status is-err">{reason}</div>
+                {retry_btn}
+            </div>
+        }
+        .into_any(),
+        TurnStatus::StepLimit => view! {
+            <div class="turn-foot">
+                <div class="turn-status is-warn">"Stopped at the step limit. Send a message to keep going."</div>
+                <div class="turn-meta">{meta.clone()}</div>
+            </div>
+        }
+        .into_any(),
+    };
     view! {
-        <button class="mini-btn retry-btn" on:click=move |_| agent::retry(&ctx)>"Retry"</button>
+        <article class="msg msg-assistant" data-turn=turn_id>
+            <div class="turn-body">{body}{live_tail}</div>
+            {footer}
+        </article>
     }
     .into_any()
-}
-
-/// A code segment as parsed from fenced blocks.
-pub enum Segment {
-    Text(String),
-    Code { lang: String, body: String },
-}
-
-/// Split assistant text on ``` fences. An unterminated fence (mid-stream)
-/// still renders as code.
-pub fn split_fences(content: &str) -> Vec<Segment> {
-    let mut segments = Vec::new();
-    for (index, part) in content.split("```").enumerate() {
-        if index % 2 == 0 {
-            if !part.trim().is_empty() {
-                segments.push(Segment::Text(part.to_string()));
-            }
-        } else {
-            let (lang, body) = match part.split_once('\n') {
-                Some((first, rest)) => (first.trim().to_string(), rest.to_string()),
-                None => (part.trim().to_string(), String::new()),
-            };
-            let lang = if lang.is_empty() || lang.len() > 24 {
-                "text".to_string()
-            } else {
-                lang
-            };
-            segments.push(Segment::Code { lang, body });
-        }
-    }
-    segments
-}
-
-/// Render message content: paragraphs as escaped text, code as cards. All
-/// text lands in text nodes — raw model HTML can never execute here.
-fn render_body(ctx: AppCtx, message: &Message) -> Vec<AnyView> {
-    let mut out = Vec::new();
-    for segment in split_fences(&message.content) {
-        match segment {
-            Segment::Text(text) => {
-                out.push(view! { <p class="msg-text">{text}</p> }.into_any());
-            }
-            Segment::Code { lang, body } => {
-                let is_html = lang.eq_ignore_ascii_case("html");
-                let preview: String = body.chars().take(600).collect();
-                let artifact = if is_html {
-                    Artifact::Html {
-                        title: "HTML preview".to_string(),
-                        body: body.clone(),
-                    }
-                } else {
-                    Artifact::Code {
-                        lang: lang.clone(),
-                        body: body.clone(),
-                    }
-                };
-                let open_label = if is_html { "Preview" } else { "Open" };
-                out.push(
-                    view! {
-                        <div class="codecard">
-                            <div class="codecard-head">
-                                <span class="codecard-lang">{lang}</span>
-                                <button
-                                    class="mini-btn"
-                                    on:click=move |_| ctx.artifact.set(Some(artifact.clone()))
-                                >
-                                    {open_label}
-                                </button>
-                            </div>
-                            <pre class="codecard-pre"><code>{preview}</code></pre>
-                        </div>
-                    }
-                    .into_any(),
-                );
-            }
-        }
-    }
-    if out.is_empty() {
-        out.push(view! { <p class="msg-text msg-placeholder">"…"</p> }.into_any());
-    }
-    out
 }

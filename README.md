@@ -117,6 +117,9 @@ yourself is kept verbatim. A failed/stale list never overwrites the lock.
 
 ## Scope
 
+Stage 3 (Nov 2026): agent harness. Event log, tool loop with approval modes and per-tool rules, phone-local workspace with diffs and undo, pause/resume and reload recovery, context and event-log sheets. Tests: `cargo test --workspace`, `node tests/e2e/run.mjs` (mock proxy, 390x844 shots), `node tests/e2e/storage-compat.mjs` (real Stage 2 ⇄ Stage 3 storage), `node tests/e2e/live.mjs` (opt-in live turn through the dev-server). See /workspace/wo/harness-wasm/STAGE3-RETURN.md.
+
+
 This is the Stage 2 first pass: shell, sessions, streaming thread with
 Cancel/Retry, Connect card, locked model + migration, safe rendering, basic
 artifact sheet, and the full proxy. Tool loops, richer artifacts, and the

@@ -1,6 +1,26 @@
 //! Small web_sys helpers: viewport tracking (§7) and scroll nudges.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen::{closure::Closure, JsCast};
+
+static PAGE_HIDING: AtomicBool = AtomicBool::new(false);
+
+/// True once the page is being torn down (reload / navigation / tab close).
+/// A stream that dies because of that is settled as Paused, not Interrupted.
+pub fn page_hiding() -> bool {
+    PAGE_HIDING.load(Ordering::Relaxed)
+}
+
+pub fn setup_pagehide_tracking() {
+    let on_hide = Closure::wrap(Box::new(move || PAGE_HIDING.store(true, Ordering::Relaxed)) as Box<dyn FnMut()>);
+    let on_show = Closure::wrap(Box::new(move || PAGE_HIDING.store(false, Ordering::Relaxed)) as Box<dyn FnMut()>);
+    let w = window();
+    let _ = w.add_event_listener_with_callback("pagehide", on_hide.as_ref().unchecked_ref());
+    let _ = w.add_event_listener_with_callback("beforeunload", on_hide.as_ref().unchecked_ref());
+    let _ = w.add_event_listener_with_callback("pageshow", on_show.as_ref().unchecked_ref());
+    on_hide.forget();
+    on_show.forget();
+}
 
 pub fn window() -> web_sys::Window {
     web_sys::window().expect("no window")
@@ -54,8 +74,21 @@ pub fn scroll_thread_to_bottom() {
     }
 }
 
-/// Scroll on the next tick, after DOM updates land.
-pub fn schedule_scroll_to_bottom() {
+/// Distance from the thread's bottom edge, in px.
+pub fn thread_distance_from_bottom() -> i32 {
+    document()
+        .get_element_by_id("thread")
+        .map(|el| el.scroll_height() - el.scroll_top() - el.client_height())
+        .unwrap_or(0)
+}
+
+/// Scroll on the next tick, after DOM updates land — only while the reader
+/// is pinned to the bottom, so streaming never yanks someone reading back.
+pub fn schedule_scroll_to_bottom(ctx: &crate::state::AppCtx) {
+    use leptos::prelude::GetUntracked;
+    if !ctx.pinned.get_untracked() {
+        return;
+    }
     let callback = Closure::once_into_js(move || scroll_thread_to_bottom());
     let callback: js_sys::Function = callback.dyn_into().expect("closure as function");
     let _ = window().set_timeout_with_callback(&callback);

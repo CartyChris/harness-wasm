@@ -5,6 +5,8 @@
 use crate::net::{self, NetError};
 use crate::state::AppCtx;
 use crate::storage;
+use harness_core::permissions::{decide, mode_default, ApprovalMode, Permission};
+use harness_core::tools::{ToolKind, REGISTRY};
 use harness_core::{normalize_model_input, Settings};
 use leptos::prelude::*;
 
@@ -18,6 +20,7 @@ enum ListState {
 
 #[component]
 pub fn SettingsSheet(ctx: AppCtx) -> impl IntoView {
+    let ctx = ctx;
     let initial = ctx.settings.get_untracked();
     let base_url = RwSignal::new(initial.base_url.clone());
     let token = RwSignal::new(initial.token.clone());
@@ -107,14 +110,16 @@ pub fn SettingsSheet(ctx: AppCtx) -> impl IntoView {
         <div class="overlay" role="dialog" aria-modal="true" aria-label="Settings">
             <button class="overlay-backdrop" aria-label="Close settings" on:click=close></button>
             <section class="sheet">
+                <div class="sheet-grab" aria-hidden="true"></div>
                 <header class="sheet-head">
-                    <h2>"Connect"</h2>
+                    <h2>"Settings"</h2>
                     <button class="icon-btn" aria-label="Close" on:click=close>
                         <span class="icon-close" aria-hidden="true"></span>
                     </button>
                 </header>
 
                 <div class="sheet-body">
+                    <div class="sec-title">"Connect"</div>
                     <label class="field">
                         <span class="field-label">"Proxy URL"</span>
                         <input
@@ -166,6 +171,8 @@ pub fn SettingsSheet(ctx: AppCtx) -> impl IntoView {
                         </datalist>
                         <span class="field-hint">{list_status}</span>
                     </div>
+
+                    <AgentSettings ctx=ctx />
                 </div>
 
                 <footer class="sheet-foot">
@@ -173,6 +180,116 @@ pub fn SettingsSheet(ctx: AppCtx) -> impl IntoView {
                 </footer>
             </section>
         </div>
+    }
+}
+
+/// Approval mode (codex) + per-tool allow / ask / deny (opencode). These
+/// apply immediately — they gate the very next tool call.
+#[component]
+fn AgentSettings(ctx: AppCtx) -> impl IntoView {
+    let modes: Vec<AnyView> = ApprovalMode::ALL
+        .iter()
+        .map(|&m| {
+            view! {
+                <button
+                    class="seg-btn"
+                    class:is-active=move || ctx.mode.get() == m
+                    aria-pressed=move || (ctx.mode.get() == m).to_string()
+                    on:click=move |_| {
+                        ctx.mode.set(m);
+                        storage::save_mode(m, &ctx);
+                    }
+                >
+                    {m.label()}
+                </button>
+            }
+            .into_any()
+        })
+        .collect();
+    let tool_rows: Vec<AnyView> = REGISTRY
+        .iter()
+        .map(|spec| {
+            let name = spec.name;
+            let kind = if spec.kind == ToolKind::Write { "write" } else { "read" };
+            let effective = move || {
+                let p = decide(spec, ctx.mode.get(), &ctx.rules.get());
+                let source = if ctx.rules.with(|r| r.get(name).is_some()) && !(ctx.mode.get() == ApprovalMode::ReadOnly && spec.kind == ToolKind::Write) {
+                    "rule"
+                } else {
+                    "mode"
+                };
+                format!("→ {} ({source})", p.label())
+            };
+            let choices: Vec<AnyView> = [None, Some(Permission::Allow), Some(Permission::Ask), Some(Permission::Deny)]
+                .into_iter()
+                .map(|choice| {
+                    let label = match choice {
+                        None => "Default",
+                        Some(p) => p.label(),
+                    };
+                    let active = move || ctx.rules.with(|r| r.get(name)) == choice;
+                    let class = match choice {
+                        Some(Permission::Allow) => "seg-btn sm allow",
+                        Some(Permission::Ask) => "seg-btn sm ask",
+                        Some(Permission::Deny) => "seg-btn sm deny",
+                        None => "seg-btn sm",
+                    };
+                    view! {
+                        <button
+                            class=class
+                            class:is-active=active
+                            aria-pressed=move || active().to_string()
+                            aria-label=format!("{name}: {label}")
+                            on:click=move |_| {
+                                ctx.rules.update(|r| r.set(name, choice));
+                                storage::save_rules(&ctx.rules.get_untracked(), &ctx);
+                            }
+                        >
+                            {label}
+                        </button>
+                    }
+                    .into_any()
+                })
+                .collect();
+            let default_hint = move || format!("default: {}", mode_default(spec, ctx.mode.get()).label());
+            view! {
+                <div class="perm-row" data-tool=name>
+                    <div class="perm-head">
+                        <code class="perm-name">{name}</code>
+                        <span class=format!("perm-kind {kind}")>{kind}</span>
+                        <span class="perm-eff">{effective}</span>
+                    </div>
+                    <div class="seg perm-seg">{choices}</div>
+                    <div class="field-hint">{default_hint}</div>
+                </div>
+            }
+            .into_any()
+        })
+        .collect();
+    let toggle_tools = move |_| {
+        let on = !ctx.tools_enabled.get_untracked();
+        ctx.tools_enabled.set(on);
+        storage::save_tools_enabled(on, &ctx);
+    };
+    view! {
+        <div class="sec-title">"Agent"</div>
+        <div class="field">
+            <span class="field-label">"Approval mode"</span>
+            <div class="seg mode-seg">{modes}</div>
+            <span class="field-hint">{move || ctx.mode.get().blurb()}</span>
+        </div>
+        <div class="field">
+            <div class="field-row">
+                <span class="field-label">"Workspace tools"</span>
+                <button class="switch" class:is-on=move || ctx.tools_enabled.get() role="switch"
+                    aria-checked=move || ctx.tools_enabled.get().to_string() aria-label="Workspace tools" on:click=toggle_tools>
+                    <span class="switch-knob" aria-hidden="true"></span>
+                </button>
+            </div>
+            <span class="field-hint">"Tools act only on a phone-local virtual workspace — no shell, no network. Turn off for models without tool support."</span>
+        </div>
+        <div class="sec-title">"Tool permissions"</div>
+        <div class="perm-list">{tool_rows}</div>
     }
 }
 
