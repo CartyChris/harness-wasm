@@ -166,7 +166,8 @@ noscript p {
 /* [GATE] tap targets ≥44px */
 .icon-btn, .send-btn, .mini-btn, .primary-btn, .secondary-btn,
 .session-open, .banner-connect, .chip, .seg-btn, .act-head, .approve-btn,
-.suggest, .menu-item, .switch, .jump-btn, .model-chip {
+.suggest, .menu-item, .switch, .jump-btn, .model-chip,
+.foot-btn, .pw-toggle, .show-all, .import-btn {
   min-height: 44px;
   min-width: 44px;
   display: inline-flex;
@@ -372,6 +373,7 @@ noscript p {
 .codecard-lang { font-size: 12.5px; color: var(--text-dim); font-family: var(--mono); }
 .codecard-meta { flex: 1; font-size: 12px; color: var(--text-faint); }
 .codecard-head .mini-btn { background: transparent; border: none; color: var(--accent); font-weight: 600; }
+.codecard-head .code-copy { color: var(--text-dim); }
 .codecard-pre {
   margin: 0; padding: 12px 14px; max-height: 240px; overflow: auto;
   font-family: var(--mono); font-size: 13px; line-height: 1.55; color: #e9dccd; white-space: pre;
@@ -402,8 +404,15 @@ noscript p {
 
 /* turn footer */
 .turn-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; margin-top: 6px; }
+.turn-actions { display: flex; gap: 2px; margin-left: -10px; }
+.turn-actions:empty { display: none; }
+.foot-btn { gap: 6px; padding: 0 10px; font-size: 13px; font-weight: 560; color: var(--text-dim); border-radius: 12px; }
+.foot-btn:active { background: var(--bg-raised-2); color: var(--text); }
+.copy-glyph { width: 11px; height: 13px; flex: none; position: relative; border: 1.6px solid currentColor; border-radius: 3px; margin: 0 2px 0 0; }
+.copy-glyph::after { content: ""; position: absolute; left: 2px; top: -5px; width: 8px; height: 10px; border: 1.6px solid currentColor; border-radius: 3px; border-left-color: transparent; border-bottom-color: transparent; }
+.turn-hint { color: var(--text-faint); }
 .turn-meta { font-size: 12px; color: var(--text-faint); letter-spacing: 0.1px; }
-.turn-status { font-size: 13.5px; color: var(--text-faint); display: inline-flex; align-items: center; gap: 8px; }
+.turn-status { font-size: 13.5px; color: var(--text-faint); display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; max-width: 100%; min-width: 0; }
 .turn-status.is-err { color: var(--danger); }
 .turn-status.is-warn { color: var(--warn); }
 .turn-status.is-paused { color: var(--info); }
@@ -468,6 +477,14 @@ noscript p {
 .approve { padding: 2px 12px 12px; }
 .approve-q { font-size: 14px; color: var(--text); margin: 4px 0 10px; line-height: 1.45; }
 .approve-row { display: flex; gap: 8px; }
+.approve-diff:empty { display: none; }
+.approve-diff { margin: 0 0 10px; }
+.approve-diff .diff { margin: 0; }
+.approve-warn { font-size: 13px; color: var(--danger); margin: 0 0 10px; }
+.diff.is-proposed { border-style: dashed; }
+.dl.del.whole { white-space: normal; font-weight: 600; padding: 6px 12px 6px 0; }
+.diff.is-proposed.is-all .diff-body { max-height: 55vh; }
+.show-all { width: 100%; justify-content: flex-start; padding: 0 12px; font-family: inherit; font-size: 13px; color: var(--accent); background: transparent; border: none; border-top: 1px solid var(--line-soft); border-radius: 0; }
 .approve-btn { flex: 1; padding: 0 8px; font-size: 14px; font-weight: 600; border-radius: 12px; border: 1px solid var(--line); background: var(--bg-raised-2); white-space: nowrap; }
 .approve-btn.yes { background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; }
 .approve-btn.no { color: var(--danger); }
@@ -482,6 +499,7 @@ noscript p {
 .diff-stat { flex: none; font-family: var(--mono); font-size: 12px; }
 .diff-stat .add { color: var(--ok); }
 .diff-stat .del { color: var(--danger); }
+.diff-stat .is-zero { color: var(--text-faint); }
 .diff-body { max-height: 260px; overflow: auto; padding: 6px 0; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; }
 .dl { display: flex; white-space: pre; padding: 0 12px 0 0; min-width: max-content; color: #cfc6b8; }
 .dl-sign { flex: none; width: 22px; text-align: center; color: var(--text-faint); }
@@ -575,6 +593,23 @@ noscript p {
 .send-glyph.is-stop::before, .send-glyph.is-stop::after { display: none; }
 
 .composer-foot { margin-top: 3px; text-align: center; font-size: 11px; color: var(--text-faint); }
+/* ⌘⏎ means nothing on a phone: keyboard hint only for fine pointers */
+@media (pointer: coarse) { .kbd-hint { display: none; } }
+.chip-unit { color: var(--text-faint); font-weight: 500; }
+/* 390px: while Pause/Resume is in the row, the log chip shows its number only
+   (its aria-label + title still say "Event log: N events") */
+.composer-row:has(.pause-chip, .resume-chip) .log-chip .chip-unit { display: none; }
+.ctx-chip.is-near { color: var(--warn); }
+.ctx-chip.is-near .chip-unit { color: var(--warn); }
+
+/* toast (Copied) — above the composer, never under the keyboard */
+.toast {
+  position: fixed; left: 50%; transform: translateX(-50%); z-index: 60;
+  top: calc(var(--vvtop, 0px) + var(--vvh, 100dvh) - var(--sab) - 150px);
+  padding: 9px 16px; border-radius: 999px; font-size: 14px; font-weight: 600;
+  background: var(--text); color: var(--bg); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  pointer-events: none; animation: sheet-in 0.16s ease-out; white-space: nowrap;
+}
 
 .jump-btn {
   position: absolute; left: 50%; top: -52px; transform: translateX(-50%);
@@ -715,6 +750,30 @@ datalist { display: none; }
 
 /* artifacts */
 .artifact-sheet { max-height: 92%; }
+/* full-screen artifact (Claude's artifact view): whole visual viewport */
+.artifact-sheet.is-full {
+  width: 100%; max-width: none; height: var(--vvh, 100dvh); max-height: none; border-radius: 0; border: none;
+  padding-top: calc(var(--sat) + 8px);
+}
+.artifact-sheet.is-full .artifact-frame { min-height: 0; }
+.full-glyph { width: 14px; height: 14px; position: relative; flex: none; }
+.full-glyph::before, .full-glyph::after { content: ""; position: absolute; width: 6px; height: 6px; border: 2px solid currentColor; }
+.full-glyph::before { left: 0; bottom: 0; border-right: none; border-top: none; }
+.full-glyph::after { right: 0; top: 0; border-left: none; border-bottom: none; }
+.full-glyph.is-exit::before { left: 2px; bottom: 2px; border: 2px solid currentColor; border-left: none; border-bottom: none; }
+.full-glyph.is-exit::after { right: 2px; top: 2px; border: 2px solid currentColor; border-right: none; border-top: none; }
+
+/* access token: masked, with a 44px Show/Hide */
+.pw-row { display: flex; gap: 8px; align-items: stretch; }
+.pw-row .field-input { flex: 1; min-width: 0; }
+.pw-toggle { flex: none; padding: 0 14px; font-size: 14px; font-weight: 600; background: var(--bg-raised-2); border: 1px solid var(--line); color: var(--text); }
+
+/* chats export / import */
+.data-row { display: flex; gap: 8px; margin: 4px 0 6px; }
+.data-row > * { flex: 1; }
+.import-btn { position: relative; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.data-status.is-err { color: var(--danger); }
 .artifact-body { flex: 1; min-height: 0; display: flex; flex-direction: column; border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--line); background: var(--bg-sunk); }
 .artifact-pre { flex: 1; margin: 0; padding: 12px; overflow: auto; font-family: var(--mono); font-size: 13px; line-height: 1.5; color: #e9dccd; white-space: pre; }
 .artifact-frame { flex: 1; width: 100%; min-height: 50vh; border: none; background: #fff; }

@@ -8,7 +8,7 @@
 
 import { startMock } from './mock-proxy.mjs';
 import { createRequire } from 'node:module';
-import { existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -56,6 +56,7 @@ await context.addInitScript(function () {
     localStorage.setItem('harness.settings', JSON.stringify({ base_url: location.origin, token: 'demo-token' }));
   }
 });
+await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'http://127.0.0.1:' + PORT });
 const page = await context.newPage();
 const pageErrors = [];
 page.on('pageerror', function (e) { pageErrors.push(e.message); });
@@ -108,6 +109,14 @@ await page.goto('http://127.0.0.1:' + PORT + '/');
 await page.waitForSelector('.composer-input');
 check('boot: fresh profile model is x-ai/grok-4.7', (await page.textContent('.model-name')).trim() === 'grok-4.7');
 check('boot: empty state with suggestions', (await page.locator('.suggest').count()) === 4);
+const chips = await page.evaluate(function () {
+  return { ctx: document.querySelector('button[aria-label="Context"]').textContent, log: document.querySelector('button[aria-label="Event log"]').textContent, ctxTitle: document.querySelector('button[aria-label="Context"]').title };
+});
+check('P2.6 chips carry a visible meaning (tok / events) + stable aria-label', /\d+(\.\dk)? tok$/.test(chips.ctx.trim()) && /^\d+ events?$/.test(chips.log.trim()) && /tokens/.test(chips.ctxTitle), JSON.stringify(chips));
+const hint = await page.evaluate(function () {
+  return { coarse: matchMedia('(pointer: coarse)').matches, kbd: getComputedStyle(document.querySelector('.kbd-hint')).display, foot: document.querySelector('.composer-foot').innerText };
+});
+check('P2.5 ⌘⏎ hint hidden on touch (pointer: coarse), mode line kept', hint.coarse && hint.kbd === 'none' && hint.foot.indexOf('⌘') < 0 && /approval/.test(hint.foot), JSON.stringify(hint));
 await shot('01-empty-state');
 
 // ------------------------------------------ 2. codex tool loop + opencode ask
@@ -123,10 +132,28 @@ check('aider: system message carries the workspace map', first.messages[0].role 
 check('secrets: no key-shaped value in the request', JSON.stringify(first).indexOf('sk-or-') < 0);
 check('opencode: write_file waits for approval in Ask mode', (await page.textContent('.act[data-status="ask"] .act-badge')).indexOf('Needs approval') >= 0);
 await shot('03-approval-card-opencode');
+const pre = await page.evaluate(function () {
+  var d = document.querySelector('.approve .diff');
+  return d ? { head: d.querySelector('.diff-head').innerText, body: d.querySelector('.diff-body').innerText, rows: d.querySelectorAll('.dl').length, more: !!d.querySelector('.show-all'), undo: !!d.querySelector('.undo-btn'), applied: document.querySelectorAll('.diff:not(.is-proposed)').length } : null;
+});
+check('P1.1 write_file diff visible BEFORE Allow (proposed, collapsed, no Undo)',
+  !!pre && /will create/i.test(pre.head) && pre.body.indexOf('<!DOCTYPE html>') >= 0 && pre.body.indexOf('<title>Tip</title>') >= 0 && pre.more && !pre.undo && pre.applied === 0, pre && (pre.head.replace(/\s+/g, ' ') + ' · rows ' + pre.rows));
+await page.click('.approve .show-all');
+const allRows = await page.locator('.approve .diff .dl').count();
+check('P1.1 "Show all" expands the proposed diff to the whole new file', allRows >= 23, allRows + ' rows');
+await page.evaluate(function () { var c = document.querySelector('.approve'); c.scrollIntoView({ block: 'end' }); });
+await shot('03b-approval-with-diff');
 
 await page.click('.approve-btn.yes');
 await page.waitForSelector('.diff', { timeout: 10000 });
 await page.waitForSelector('.act[data-status="ask"]', { timeout: 10000 });
+const editPre = await page.evaluate(function () {
+  var d = document.querySelector('.approve .diff');
+  return d ? { head: d.querySelector('.diff-head').innerText, add: [].map.call(d.querySelectorAll('.dl.add'), function (r) { return r.innerText; }).join('\n'), del: [].map.call(d.querySelectorAll('.dl.del'), function (r) { return r.innerText; }).join('\n') } : null;
+});
+check('P1.1 edit_file SEARCH/REPLACE shown as a line diff BEFORE Allow', !!editPre && /will edit/i.test(editPre.head) && editPre.del.indexOf('value="18"') >= 0 && editPre.add.indexOf('value="20"') >= 0, editPre && editPre.head.replace(/\s+/g, ' '));
+await page.evaluate(function () { var c = document.querySelector('.approve'); c.scrollIntoView({ block: 'end' }); });
+await shot('03c-approval-edit-diff');
 await page.click('.act[data-status="ask"] .approve-btn.always');
 await page.waitForSelector('.turn-meta', { timeout: 15000 });
 const toolCards = await page.locator('.timeline .act').count();
@@ -142,6 +169,20 @@ await page.evaluate(function () { document.getElementById('thread').scrollTop = 
 await page.waitForTimeout(100);
 await page.evaluate(function () { var t = document.getElementById('thread'); t.scrollTop = t.scrollHeight; });
 await shot('04-completed-turn-tools-diff');
+const zero = await page.evaluate(function () {
+  var created = [].find.call(document.querySelectorAll('.diff'), function (d) { return /^created$/i.test(d.querySelector('.diff-verb').innerText); });
+  var del = created.querySelector('.diff-stat .del');
+  return { text: del.innerText, zero: del.classList.contains('is-zero'), color: getComputedStyle(del).color, danger: getComputedStyle(document.documentElement).getPropertyValue('--danger').trim() };
+});
+check('P3.9 zero count "−0" renders muted, not red', zero.zero && /0/.test(zero.text) && zero.color !== 'rgb(255, 107, 107)' && zero.color.indexOf('255, 1') < 0, JSON.stringify(zero));
+await page.click('.copy-btn');
+await page.waitForSelector('.toast');
+const clip1 = await page.evaluate(function () { return navigator.clipboard.readText(); });
+check('P2.4 Copy on the reply footer copies the reply text (no tool JSON)', clip1.indexOf("I'll build it as one self-contained file") === 0 && clip1.indexOf('Done. **index.html**') > 0 && clip1.indexOf('"content"') < 0, clip1.slice(0, 60));
+check('P2.4 "Copied" toast shown', (await page.textContent('.toast')).trim() === 'Copied');
+await shot('04b-copy-toast');
+await page.waitForSelector('.toast', { state: 'detached', timeout: 4000 });
+check('P2.4 toast clears itself', (await page.locator('.toast').count()) === 0);
 
 // Expand the first card: Action → Observation (OpenHands).
 await page.click('.timeline .act >> nth=0 >> .act-head');
@@ -201,7 +242,42 @@ check('overlay: menu unmounted after choosing', (await page.locator('.menu').cou
 // ------------------------------- 7. settings / model sheet + permissions
 await page.click('.model-chip');
 await page.waitForSelector('.sheet .field-input');
+check('P2.7 access token masked by default (type=password, 16px)', (await page.getAttribute('#access-token', 'type')) === 'password' &&
+  (await page.evaluate(function () { return getComputedStyle(document.getElementById('access-token')).fontSize; })) === '16px');
+await page.click('.pw-toggle');
+const shown = await page.getAttribute('#access-token', 'type');
+const toggleLabel = await page.getAttribute('.pw-toggle', 'aria-label');
+await page.click('.pw-toggle');
+check('P2.7 Show/Hide toggle reveals and re-masks', shown === 'text' && toggleLabel === 'Hide access token' && (await page.getAttribute('#access-token', 'type')) === 'password');
 await shot('10-settings-model-sheet');
+// P1.3 export: proxy URL + token stripped
+await page.locator('.export-btn').scrollIntoViewIfNeeded();
+const [download] = await Promise.all([page.waitForEvent('download'), page.click('.export-btn')]);
+const exportPath = join(SHOTS, 'export-sample.json');
+await download.saveAs(exportPath);
+const exported = readFileSync(exportPath, 'utf8');
+const exportedJson = JSON.parse(exported);
+check('P1.3 export has sessions + events, no access token, no proxy URL',
+  exportedJson.format === 'harness-chats' && exportedJson.sessions.length >= 1 && exportedJson.sessions[0].events.length > 3 &&
+  exported.indexOf('demo-token') < 0 && exported.indexOf('127.0.0.1:' + PORT) < 0 && exported.indexOf('"token"') < 0 && exported.indexOf('base_url') < 0,
+  exportedJson.sessions.length + ' sessions, ' + exported.length + ' bytes');
+await page.waitForSelector('.data-status');
+// P1.3 import of a poisoned file is refused, nothing written
+const sessionsBefore = await page.evaluate(function () { return JSON.parse(localStorage.getItem('harness.sessions')).length; });
+const poisonPath = join(SHOTS, 'poisoned-import.json');
+const poisoned = JSON.parse(exported);
+poisoned.sessions[0].id = 's-poison';
+poisoned.sessions[0].title = 'Poisoned';
+poisoned.sessions[0].events[0].text = 'my key ' + ['sk', '-or-', 'v1-', '0123456789abcdef0123456789'].join('');
+writeFileSync(poisonPath, JSON.stringify(poisoned));
+await page.setInputFiles('.import-btn input[type=file]', poisonPath);
+await page.waitForSelector('.data-status.is-err');
+const refusal = await page.textContent('.data-status');
+const sessionsAfter = await page.evaluate(function () { return JSON.parse(localStorage.getItem('harness.sessions')).length; });
+check('P1.3 key-shaped import refused with a plain message, nothing saved', /^Import refused: it contains an OpenRouter-style key/.test(refusal) && sessionsAfter === sessionsBefore &&
+  (await page.evaluate(function () { return localStorage.getItem('harness.sessions').indexOf('Poisoned') < 0; })), refusal);
+await page.evaluate(function () { var b = document.querySelector('.sheet-body'); b.scrollTop = b.scrollHeight; });
+await shot('10b-export-import-refused');
 const effective = await page.textContent('.perm-row[data-tool="write_file"] .perm-eff');
 check('codex+opencode: read-only sandbox denies write_file', effective.indexOf('Deny') >= 0, effective);
 await page.click('.mode-seg .seg-btn >> text=Ask');
@@ -221,7 +297,30 @@ const sandbox = await page.getAttribute('iframe.artifact-frame', 'sandbox');
 check('safe: artifact HTML only in sandboxed iframe (no allow-same-origin)', sandbox === 'allow-scripts', sandbox);
 await page.waitForTimeout(400);
 await shot('12-artifact-preview');
+await page.click('.full-btn');
+await page.waitForTimeout(150);
+const fullBox = await page.evaluate(function () { var r = document.querySelector('.artifact-sheet').getBoundingClientRect(); return { top: r.top, h: r.height, label: document.querySelector('.full-btn').getAttribute('aria-label') }; });
+check('P3.10 artifact opens full screen (whole viewport) and toggles back', fullBox.top === 0 && fullBox.h === 844 && fullBox.label === 'Exit full screen', JSON.stringify(fullBox));
+await shot('12b-artifact-fullscreen');
+await page.click('.full-btn');
 await page.click('.artifact-sheet button[aria-label="Close"]');
+
+// P1.1 delete_file: the card names the file and its line count in red before Allow
+await page.fill('.composer-input', 'Please delete index.html');
+await page.click('button[aria-label="Send"]');
+await page.waitForSelector('.act[data-status="ask"] .approve .diff.is-delete', { timeout: 15000 });
+const delCard = await page.evaluate(function () {
+  var d = document.querySelector('.act[data-status="ask"] .approve .diff.is-delete');
+  var row = d.querySelector('.dl.del.whole');
+  return { head: d.textContent, row: row ? row.textContent : '', color: row ? getComputedStyle(row).color : '' };
+});
+check('P1.1 delete_file preview shows the filename and line count in red before Allow',
+  /will delete/i.test(delCard.head) && delCard.head.indexOf('index.html') >= 0 && /Deletes the whole file · 23 lines/.test(delCard.row) && /^rgb\((2[0-5]\d|1[5-9]\d),/.test(delCard.color), JSON.stringify(delCard));
+await page.evaluate(function () { var c = document.querySelector('.act[data-status="ask"] .approve'); c.scrollIntoView({ block: 'end' }); });
+await shot('03d-approval-delete-preview');
+await page.click('.act[data-status="ask"] .approve-btn.no');
+await page.waitForFunction(function () { return !document.querySelector('button[aria-label="Stop"]'); }, null, { timeout: 15000 });
+check('P1.1 denied delete leaves the file in the workspace', (await page.locator('.diff-foot .mini-btn >> text=Preview').count()) >= 1);
 
 // -------------------------------------------- 9. goose pause / resume
 await page.click('button[aria-label="New chat"]');
@@ -233,9 +332,10 @@ await page.click('.pause-chip');
 await page.waitForSelector('.turn-status.is-paused');
 const pausedText = await page.textContent('.msg-assistant .md');
 check('goose: pause keeps the partial text and the turn open', pausedText.length > 20 && (await page.locator('.resume-chip').count()) === 1, pausedText.length + ' chars');
+check('P3.8 exactly one Resume (composer chip), inline line is status text only', (await page.locator('button:has-text("Resume")').count()) === 1 && (await page.locator('.resume-btn').count()) === 0);
 await shot('13-paused-turn-goose');
 const before = requests.length;
-await page.click('.resume-btn');
+await page.click('.resume-chip');
 await page.waitForSelector('.turn-meta', { timeout: 20000 });
 const resumeBody = requests[before].body;
 const ut = userTexts(resumeBody);
@@ -254,6 +354,7 @@ await page.waitForTimeout(900);
 await page.click('.send-btn.is-stop');
 await page.waitForSelector('.retry-btn');
 check('cancel: partial kept, Retry offered', (await page.textContent('.turn-status')).indexOf('partial reply kept') >= 0);
+await shot('20-cancel-stopped-retry');
 const beforeRetry = requests.length;
 await page.click('.retry-btn');
 await page.waitForSelector('.live.has-text');
@@ -301,6 +402,26 @@ await page.waitForSelector('.turn-meta', { timeout: 15000 });
 check('safe: raw <img onerror> rendered as text, no img element', (await page.locator('.md img').count()) === 0 && (await page.textContent('.md')).indexOf('<img src=x onerror=alert(1)>') >= 0);
 check('markdown: table + code card + list rendered', (await page.locator('.md table').count()) === 1 && (await page.locator('.codecard').count()) === 1 && (await page.locator('.md ul li').count()) === 3);
 await shot('16-markdown-answer');
+await page.click('.code-copy');
+await page.waitForTimeout(150);
+const clip2 = await page.evaluate(function () { return navigator.clipboard.readText(); });
+check('P2.4 Copy on a code block copies exactly the code', clip2 === 'fn main() {\n    println!("hello from the harness");\n}', JSON.stringify(clip2));
+const usersBeforeRegen = await page.locator('.msg-user').count();
+const reqBeforeRegen = requests.length;
+check('P2.4 Regenerate offered on the latest Done turn', (await page.locator('.regen-btn').count()) === 1);
+await page.click('.regen-btn');
+await page.waitForSelector('.turn-meta', { timeout: 15000 });
+await page.waitForTimeout(200);
+const regenBody = requests[reqBeforeRegen].body;
+check('P2.4 regenerate: no duplicate user event, old reply not in history, one reply shown',
+  (await page.locator('.msg-user').count()) === usersBeforeRegen && userTexts(regenBody).length === 1 &&
+  regenBody.messages.filter(function (m) { return m.role === 'assistant'; }).length === 0 && (await page.locator('.msg-assistant').count()) === 1,
+  userTexts(regenBody).join('|'));
+await page.click('button[aria-label="Event log"]');
+await page.waitForSelector('.log-sheet .ev');
+const regenKinds = await page.locator('.ev-kind').allTextContents();
+check('P2.4 regenerate keeps exactly one user/message event in the log', regenKinds.filter(function (k) { return k === 'user/message'; }).length === 1 && regenKinds.filter(function (k) { return k === 'turn/start'; }).length === 2, regenKinds.join(' '));
+await page.click('.log-sheet button[aria-label="Close"]');
 
 // ------------------------------------- 13. keyboard-open composer
 await page.fill('.composer-input', 'Typing with the keyboard up — the composer stays pinned above it.');
@@ -315,7 +436,100 @@ check('viewport: composer above the keyboard (visualViewport-tracked)', kb.botto
 await page.screenshot({ path: join(SHOTS, '17-keyboard-open-raw.png') });
 await page.setViewportSize({ width: 390, height: 844 });
 
+// ------------------------------------------ 14. sessions drawer
+await page.click('button[aria-label="Sessions"]');
+await page.waitForSelector('.drawer .session-row');
+const drawerRows = await page.locator('.drawer .session-row').count();
+check('drawer: lists every chat', drawerRows >= 6, drawerRows + ' rows');
+await shot('19-drawer-sessions');
+await page.click('.drawer .session-row >> nth=1 >> .session-open');
+check('drawer: switching session closes the drawer', (await page.locator('.drawer').count()) === 0);
+
+// ---------------- 15. P1.2 IndexedDB: ~1 MB workspace × 3 sessions, no quota
+await page.click('button[aria-label="Approval mode"]');
+await page.click('.menu-item >> text=Auto');
+for (const tag of ['A', 'B', 'C']) {
+  await page.click('button[aria-label="New chat"]');
+  await page.fill('.composer-input', 'Write bulk files ' + tag);
+  await page.click('.send-btn');
+  await page.waitForSelector('.turn-meta', { timeout: 60000 });
+}
+await page.waitForTimeout(800);
+const store = await page.evaluate(async function () {
+  const db = await new Promise(function (res, rej) { const r = indexedDB.open('harness'); r.onsuccess = function () { res(r.result); }; r.onerror = rej; });
+  const rows = await new Promise(function (res) { const t = db.transaction('kv').objectStore('kv'); const out = []; const c = t.openCursor(); c.onsuccess = function () { const cur = c.result; if (!cur) return res(out); out.push([cur.key, cur.value.length]); cur.continue(); }; });
+  let ls = 0;
+  for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); ls += k.length + localStorage.getItem(k).length; }
+  return { rows: rows, idbKeys: rows.length, idbChars: rows.reduce(function (a, r) { return a + r[1]; }, 0), bulkSessions: rows.filter(function (r) { return r[1] > 900000; }).length, migrated: rows.some(function (r) { return r[0] === 'meta:migrated'; }), lsChars: ls, warn: !!document.querySelector('.banner-warn') };
+});
+console.log('STORAGE ' + JSON.stringify(store));
+check('P1.2 three ~1 MB sessions land in IndexedDB with no quota error', store.bulkSessions === 3 && store.migrated && !store.warn, JSON.stringify(store));
+check('P1.2 localStorage keeps only settings + the text mirror (< 100 KB)', store.lsChars < 100000, store.lsChars + ' chars');
+await page.reload();
+await page.waitForSelector('.composer-input');
+await page.click('button[aria-label="Context"]');
+await page.waitForSelector('.ctx-sheet');
+const ctxFiles = await page.locator('.ctx-file').count();
+check('P1.2 after reload the bulk workspace is restored from IndexedDB (5 files)', ctxFiles === 5, ctxFiles + ' files');
+await page.click('.ctx-sheet button[aria-label="Close"]');
+await page.click('button[aria-label="Approval mode"]');
+await page.click('.menu-item >> text=Ask');
+
+// ------------------------------- 16. error states: 401, offline, no proxy
+await page.click('button[aria-label="New chat"]');
+await page.click('.model-chip');
+await page.fill('#access-token', 'wrong-token');
+await page.click('.sheet-foot .primary-btn');
+await page.fill('.composer-input', 'Hello?');
+await page.click('.send-btn');
+await page.waitForSelector('.turn-status.is-err', { timeout: 10000 });
+const unauth = await page.textContent('.turn-status.is-err');
+// 401 opens the Connect sheet on purpose (Stage 2 behaviour).
+check('401: wrong token → plain "Connect required" + Retry, Connect sheet opened', /Connect required/.test(unauth) && (await page.locator('.retry-btn').count()) === 1 && (await page.locator('#access-token').count()) === 1, unauth);
+await shot('22b-unauthorized-connect-sheet');
+await page.click('.sheet button[aria-label="Close"]');
+await shot('22-unauthorized-401');
+await page.click('.model-chip');
+await page.fill('#access-token', 'demo-token');
+await page.click('.sheet-foot .primary-btn');
+
+await context.setOffline(true);
+await page.click('button[aria-label="New chat"]');
+await page.fill('.composer-input', 'Are you there?');
+await page.click('.send-btn');
+await page.waitForSelector('.turn-status.is-err', { timeout: 10000 });
+const offline = await page.textContent('.turn-status.is-err');
+check('offline: plain "Proxy unreachable" + Retry', /unreachable|offline/i.test(offline) && (await page.locator('.retry-btn').count()) === 1, offline);
+await shot('23-offline');
+await context.setOffline(false);
+
 check('no page errors', pageErrors.length === 0, pageErrors.join(' | '));
+
+// Fresh profile: no proxy configured → connect banner; then re-import.
+const fresh = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true });
+const fp = await fresh.newPage();
+const freshErrors = [];
+fp.on('pageerror', function (e) { freshErrors.push(e.message); });
+await fp.goto('http://127.0.0.1:' + PORT + '/');
+await fp.waitForSelector('.composer-input');
+check('no-proxy: fresh profile shows the connect banner', (await fp.locator('.banner-connect').count()) === 1);
+await fp.screenshot({ path: join(SHOTS, '21-no-proxy.png') });
+await fp.click('.banner-connect');
+await fp.waitForSelector('.import-btn');
+await fp.setInputFiles('.import-btn input[type=file]', exportPath);
+await fp.waitForSelector('.data-status');
+const importMsg = await fp.textContent('.data-status');
+await fp.click('.sheet button[aria-label="Close"]');
+await fp.click('button[aria-label="Sessions"]');
+await fp.waitForSelector('.drawer .session-row');
+await fp.waitForTimeout(400);
+const freshTitles = await fp.locator('.drawer .session-title').allTextContents();
+const exportedTitles = exportedJson.sessions.map(function (x) { return x.title; });
+check('P1.3 re-import into a fresh profile restores the same sessions', /^Imported \d+ chats? \(0 already here\)/.test(importMsg) &&
+  exportedTitles.length === freshTitles.length && exportedTitles.every(function (t) { return freshTitles.indexOf(t) >= 0; }), importMsg + ' · ' + freshTitles.join(' | '));
+await fp.screenshot({ path: join(SHOTS, '24-imported-fresh-profile.png') });
+check('no page errors (fresh profile)', freshErrors.length === 0, freshErrors.join(' | '));
+await fresh.close();
 
 await browser.close();
 server.close();

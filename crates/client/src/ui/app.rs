@@ -18,33 +18,37 @@ pub fn mount() {
     js::setup_viewport_tracking();
     js::setup_pagehide_tracking();
 
-    let document = js::document();
-    // The boot shell's job is done once WASM boots: remove it so no stale
-    // loading UI lingers under the app.
-    if let Some(shell) = document.get_element_by_id("shell") {
-        if let Some(parent) = shell.parent_node() {
-            let _ = parent.remove_child(&shell);
+    // Sessions live in IndexedDB (async): load them before the first render
+    // so nothing can save over them. The static boot shell is visible meanwhile.
+    wasm_bindgen_futures::spawn_local(async move {
+        let boot = storage::boot().await;
+        let document = js::document();
+        // The boot shell's job is done once WASM boots: remove it so no stale
+        // loading UI lingers under the app.
+        if let Some(shell) = document.get_element_by_id("shell") {
+            if let Some(parent) = shell.parent_node() {
+                let _ = parent.remove_child(&shell);
+            }
         }
-    }
 
-    let root = document
-        .get_element_by_id("app")
-        .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
-        .unwrap_or_else(|| {
-            document
-                .create_element("div")
-                .expect("div")
-                .dyn_into::<web_sys::HtmlElement>()
-                .expect("html element")
-        });
-    // forget(): the UnmountHandle owns the reactive root — dropping it would
-    // unmount the app immediately after mount.
-    leptos::mount::mount_to(root, App).forget();
+        let root = document
+            .get_element_by_id("app")
+            .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+            .unwrap_or_else(|| {
+                document
+                    .create_element("div")
+                    .expect("div")
+                    .dyn_into::<web_sys::HtmlElement>()
+                    .expect("html element")
+            });
+        // forget(): the UnmountHandle owns the reactive root — dropping it would
+        // unmount the app immediately after mount.
+        leptos::mount::mount_to(root, move || view! { <App boot /> }).forget();
+    });
 }
 
 #[component]
-pub fn App() -> impl IntoView {
-    let boot = storage::boot();
+pub fn App(boot: storage::Boot) -> impl IntoView {
     let ctx = AppCtx::new(boot);
     provide_context(ctx);
 
@@ -118,6 +122,9 @@ pub fn App() -> impl IntoView {
 
             <Thread ctx=ctx />
             <Composer ctx=ctx />
+            <Show when=move || ctx.toast.get().is_some()>
+                <div class="toast" role="status" aria-live="polite">{move || ctx.toast.get().unwrap_or_default()}</div>
+            </Show>
         </div>
 
         // Overlays unmount fully on close (DESIGN.md §7).

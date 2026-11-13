@@ -49,6 +49,22 @@ impl Session {
         }
     }
 
+    /// Fold in messages an older build appended to the text mirror after a
+    /// rollback (anything past what this log's own mirror already covers).
+    /// Returns how many messages were absorbed.
+    pub fn absorb_legacy_tail(&mut self, legacy: &[Message], at: f64) -> usize {
+        let known = legacy_mirror(&self.events).len();
+        if legacy.len() <= known {
+            return 0;
+        }
+        let tail = &legacy[known..];
+        for e in crate::events::from_legacy(tail, at) {
+            crate::events::append(&mut self.events, e.kind, at);
+        }
+        self.updated_at = self.updated_at.max(at);
+        tail.len()
+    }
+
     /// Copy of this session with `messages` set to the Stage 2 mirror of the
     /// event log. Used only when writing to storage.
     pub fn with_legacy_mirror(&self) -> Session {
@@ -58,6 +74,39 @@ impl Session {
         }
         out
     }
+}
+
+/// Combine the IndexedDB records (full logs) with the localStorage list.
+/// localStorage order wins (it is rewritten on every save). Per session:
+/// - a localStorage copy WITH events (fallback mode / Stage 3 build) that is
+///   newer replaces the stored one;
+/// - a mirror-only copy (Stage 3.1 mirror, or a Stage 2 build after a
+///   rollback) never replaces a full log; it can only add a message tail;
+/// - IndexedDB-only sessions are kept.
+pub fn merge_local_and_stored(
+    local: Vec<Session>,
+    mut stored: std::collections::HashMap<String, Session>,
+    at: f64,
+) -> Vec<Session> {
+    let mut out = Vec::with_capacity(local.len() + stored.len());
+    for mut l in local {
+        match stored.remove(&l.id) {
+            None => {
+                l.migrate_legacy(at);
+                out.push(l);
+            }
+            Some(s) if !l.events.is_empty() => out.push(if l.updated_at > s.updated_at { l } else { s }),
+            Some(mut s) => {
+                s.absorb_legacy_tail(&l.messages, at);
+                out.push(s);
+            }
+        }
+    }
+    if !stored.is_empty() {
+        out.extend(stored.into_values());
+        out.sort_by(|a, b| b.updated_at.partial_cmp(&a.updated_at).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    out
 }
 
 /// Stage-2-shaped view of an event log: one user message per prompt and one
@@ -269,5 +318,49 @@ mod tests {
         // Storage without the mirror (pre-fix Stage 3 shape) would not parse.
         let bare = r#"[{"id":"s1","title":"Tip","updated_at":1.0,"events":[]}]"#;
         assert!(serde_json::from_str::<Vec<Stage2Session>>(bare).is_err());
+    }
+
+    #[test]
+    fn merge_keeps_full_logs_and_absorbs_rollback_tails() {
+        use crate::events::{EventKind, Outcome};
+        use crate::permissions::ApprovalMode;
+        use std::collections::HashMap;
+        let mut full = Session::new("a".into(), "A".into(), 10.0);
+        full.append(EventKind::UserMessage { id: "u1".into(), text: "hi".into() }, 10.0);
+        full.append(EventKind::TurnStart { turn: "t1".into(), model: "m".into(), mode: ApprovalMode::Ask, retry_of: None }, 10.0);
+        full.append(EventKind::AssistantMessage { turn: "t1".into(), step: 1, text: "yo".into(), tool_calls: vec![], partial: false }, 10.0);
+        full.append(EventKind::TurnEnd { turn: "t1".into(), outcome: Outcome::Done }, 10.0);
+        let stored: HashMap<String, Session> = [("a".to_string(), full.clone())].into();
+
+        // 1. Mirror-only copy written LATER (async IDB commit lost on reload):
+        //    the full log must win, nothing absorbed.
+        let mut mirror = full.with_legacy_mirror();
+        mirror.events.clear();
+        mirror.updated_at = 99.0;
+        let out = merge_local_and_stored(vec![mirror.clone()], stored.clone(), 100.0);
+        assert_eq!(out[0].events, full.events);
+
+        // 2. Stage 2 build after a rollback appended a Q+A: absorbed as a tail.
+        let mut rolled = mirror.clone();
+        rolled.messages.push(Message::user("u2".into(), "again".into()));
+        let mut a2 = Message::assistant("a2".into(), "m".into());
+        a2.content = "sure".into();
+        a2.status = "Done".into();
+        rolled.messages.push(a2);
+        let out = merge_local_and_stored(vec![rolled], stored.clone(), 100.0);
+        assert_eq!(out[0].events.len(), full.events.len() + 4);
+        assert_eq!(legacy_mirror(&out[0].events).len(), 4);
+
+        // 3. A newer FULL local copy (fallback mode) replaces the stored one.
+        let mut newer = full.clone();
+        newer.append(EventKind::UserMessage { id: "u3".into(), text: "new".into() }, 50.0);
+        let out = merge_local_and_stored(vec![newer.clone()], stored.clone(), 100.0);
+        assert_eq!(out[0].events, newer.events);
+
+        // 4. Unknown local sessions (Stage 2 shape) migrate; IDB-only kept.
+        let s2: Session = serde_json::from_str(r#"{"id":"b","title":"B","updated_at":5.0,"messages":[{"id":"m","type":"user","content":"x"}]}"#).unwrap();
+        let out = merge_local_and_stored(vec![s2], stored, 100.0);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.iter().find(|s| s.id == "b").unwrap().events.len(), 1);
     }
 }

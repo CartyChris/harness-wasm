@@ -42,6 +42,9 @@ pub fn Composer(ctx: AppCtx) -> impl IntoView {
         let ws = Workspace::derive(&session.events);
         assemble(&session.events, &ws, DEFAULT_BUDGET_TOKENS).est_tokens
     });
+    // Visible meaning on the chips ("125 tok", "0 events"); aria-label stays
+    // the stable name and title spells it out. Amber near the budget.
+    let near_budget = Memo::new(move |_| tokens.get() * 10 >= DEFAULT_BUDGET_TOKENS * 8);
     let input_ref = NodeRef::<leptos::html::Textarea>::new();
 
     let do_send = move || {
@@ -144,13 +147,24 @@ pub fn Composer(ctx: AppCtx) -> impl IntoView {
                         <span class="chip-icon shield" aria-hidden="true"></span>
                         <span>{mode_label}</span>
                     </button>
-                    <button class="chip" aria-label="Context" on:click=move |_| ctx.context_open.set(true)>
+                    <button
+                        class="chip ctx-chip"
+                        class:is-near=near_budget
+                        aria-label="Context"
+                        title=move || format!("Context: about {} tokens of a {} budget", tokens.get(), short_tokens(DEFAULT_BUDGET_TOKENS))
+                        on:click=move |_| ctx.context_open.set(true)
+                    >
                         <span class="chip-icon ctx" aria-hidden="true"></span>
-                        <span>{move || short_tokens(tokens.get())}</span>
+                        <span>{move || short_tokens(tokens.get())}<span class="chip-unit">" tok"</span></span>
                     </button>
-                    <button class="chip" aria-label="Event log" on:click=move |_| ctx.log_open.set(true)>
+                    <button
+                        class="chip log-chip"
+                        aria-label="Event log"
+                        title=move || format!("Event log: {} events", event_count.get())
+                        on:click=move |_| ctx.log_open.set(true)
+                    >
                         <span class="chip-icon log" aria-hidden="true"></span>
-                        <span>{move || event_count.get().to_string()}</span>
+                        <span>{move || event_count.get().to_string()}<span class="chip-unit">{move || if event_count.get() == 1 { " event" } else { " events" }}</span></span>
                     </button>
                     <span class="composer-spacer"></span>
                     <Show when=streaming>
@@ -176,7 +190,11 @@ pub fn Composer(ctx: AppCtx) -> impl IntoView {
                     </button>
                 </div>
             </div>
-            <div class="composer-foot">"⌘⏎ send · writes ask first in Ask mode"</div>
+            <div class="composer-foot"><span class="kbd-hint">"⌘⏎ send · "</span>{move || match ctx.mode.get() {
+                ApprovalMode::ReadOnly => "Read-only: every write is blocked",
+                ApprovalMode::Ask => "Ask: writes wait for your approval",
+                ApprovalMode::Auto => "Auto: writes run without asking",
+            }}</div>
         </div>
     }
 }

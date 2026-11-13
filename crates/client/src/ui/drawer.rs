@@ -190,7 +190,7 @@ fn SessionRow(
                 view! {
                     <button class="session-open" on:click=open>
                         <span class="session-title">{title.clone()}</span>
-                        <span class="session-meta">{message_count} " messages · " {event_count} " events"</span>
+                        <span class="session-meta">{format!("{message_count} message{} · {event_count} event{}", if message_count == 1 { "" } else { "s" }, if event_count == 1 { "" } else { "s" })}</span>
                     </button>
                 }
                 .into_any()

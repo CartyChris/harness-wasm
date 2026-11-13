@@ -8,10 +8,21 @@ use crate::agent;
 use crate::state::{current_session, AppCtx, Artifact, Phase};
 use harness_core::events::{DecisionBy, ToolView};
 use harness_core::tools::{self, ToolKind};
-use harness_core::workspace::{can_undo, diff_hunks, diff_stats, line_diff, DiffTag, FileEdit};
+use harness_core::workspace::{can_undo, diff_hunks, diff_stats, line_diff, DiffTag, FileEdit, Workspace};
 use leptos::prelude::*;
 
 const MAX_DIFF_ROWS: usize = 48;
+/// Proposed diffs open collapsed to this many rows ("Show all" expands).
+const PROPOSED_ROWS: usize = 12;
+/// DOM sanity cap for "Show all" (the full file is one tap away in Open).
+const PROPOSED_MAX_ROWS: usize = 1500;
+
+/// Applied edits carry Undo; proposed ones (pre-approval) never do.
+#[derive(Clone, Copy, PartialEq)]
+enum DiffMode {
+    Applied { seq: u64, undone: bool },
+    Proposed,
+}
 
 fn status_of(view: &ToolView, awaiting: bool, running: bool) -> (&'static str, &'static str) {
     match (&view.result, view.decision) {
@@ -118,14 +129,29 @@ pub fn tool_card(ctx: AppCtx, turn: String, view: ToolView) -> AnyView {
     let approval = {
         let call_id = call_id.clone();
         let name = view.call.name.clone();
+        let call = view.call.clone();
         move || {
             awaiting.get().then(|| {
                 let (a, b, c) = (call_id.clone(), call_id.clone(), call_id.clone());
+                // Pure dry run against the workspace as it is right now:
+                // exactly the edit Allow would log (codex / opencode show the
+                // change before asking).
+                let ws = Workspace::derive(&current_session(&ctx).events);
+                let outcome = tools::execute(&call, &ws);
+                let proposal = match (outcome.ok, outcome.edit) {
+                    (true, Some(edit)) => diff_view(ctx, edit, DiffMode::Proposed),
+                    (true, None) => ().into_any(),
+                    (false, _) => view! {
+                        <div class="approve-warn" role="note">{format!("This call will fail: {}", outcome.output)}</div>
+                    }
+                    .into_any(),
+                };
                 view! {
                     <div class="approve" role="group" aria-label="Approve tool call">
                         <div class="approve-q">
-                            "Allow " <code class="ic">{name.clone()}</code> " to change your workspace?"
+                            "Allow " <code class="ic">{name.clone()}</code> " to make this change?"
                         </div>
+                        <div class="approve-diff">{proposal}</div>
                         <div class="approve-row">
                             <button class="approve-btn yes" on:click=move |_| agent::answer_approval(&ctx, &a, true, false)>"Allow once"</button>
                             <button class="approve-btn always" on:click=move |_| agent::answer_approval(&ctx, &b, true, true)>"Always allow"</button>
@@ -163,15 +189,13 @@ pub fn tool_card(ctx: AppCtx, turn: String, view: ToolView) -> AnyView {
 }
 
 pub fn diff_card(ctx: AppCtx, seq: u64, undone: bool, edit: FileEdit) -> AnyView {
-    let before = edit.before.clone().unwrap_or_default();
-    let after = edit.after.clone().unwrap_or_default();
-    let lines = line_diff(&before, &after);
-    let (add, del) = diff_stats(&lines);
-    let hunks = diff_hunks(&lines, 2);
-    let total = hunks.len();
-    let rows: Vec<AnyView> = hunks
-        .into_iter()
-        .take(MAX_DIFF_ROWS)
+    diff_view(ctx, edit, DiffMode::Applied { seq, undone })
+}
+
+fn diff_rows(hunks: &[Option<harness_core::workspace::DiffLine>], limit: usize) -> Vec<AnyView> {
+    hunks
+        .iter()
+        .take(limit)
         .map(|h| match h {
             None => view! { <div class="dl gap">"⋯"</div> }.into_any(),
             Some(line) => {
@@ -180,19 +204,60 @@ pub fn diff_card(ctx: AppCtx, seq: u64, undone: bool, edit: FileEdit) -> AnyView
                     DiffTag::Del => ("dl del", "−"),
                     DiffTag::Same => ("dl", " "),
                 };
-                view! { <div class=class><span class="dl-sign">{sign}</span><span class="dl-text">{line.text}</span></div> }.into_any()
+                view! { <div class=class><span class="dl-sign">{sign}</span><span class="dl-text">{line.text.clone()}</span></div> }.into_any()
             }
         })
-        .collect();
-    let more = (total > MAX_DIFF_ROWS).then(|| view! { <div class="dl gap">{format!("… {} more lines", total - MAX_DIFF_ROWS)}</div> });
-    let verb = match (&edit.before, &edit.after) {
-        (None, Some(_)) => "Created",
-        (Some(_), None) => "Deleted",
-        _ => "Edited",
+        .collect()
+}
+
+fn diff_view(ctx: AppCtx, edit: FileEdit, mode: DiffMode) -> AnyView {
+    let proposed = mode == DiffMode::Proposed;
+    let (seq, undone) = match mode {
+        DiffMode::Applied { seq, undone } => (seq, undone),
+        DiffMode::Proposed => (0, false),
+    };
+    let before = edit.before.clone().unwrap_or_default();
+    let after = edit.after.clone().unwrap_or_default();
+    let lines = line_diff(&before, &after);
+    let (add, del) = diff_stats(&lines);
+    let is_delete = edit.before.is_some() && edit.after.is_none();
+    let hunks = diff_hunks(&lines, 2);
+    let total = hunks.len();
+    let show_all = RwSignal::new(false);
+    let rows = {
+        let hunks = hunks.clone();
+        move || {
+            if proposed && is_delete {
+                // delete_file: filename + line count, in red — not every line.
+                let n = before.lines().count();
+                return vec![view! {
+                    <div class="dl del whole"><span class="dl-sign">"−"</span><span class="dl-text">{format!("Deletes the whole file · {n} line{}", if n == 1 { "" } else { "s" })}</span></div>
+                }
+                .into_any()];
+            }
+            let limit = match (proposed, show_all.get()) {
+                (true, false) => PROPOSED_ROWS,
+                (true, true) => PROPOSED_MAX_ROWS,
+                (false, _) => MAX_DIFF_ROWS,
+            };
+            let mut out = diff_rows(&hunks, limit);
+            if total > limit && !(proposed && !show_all.get()) {
+                out.push(view! { <div class="dl gap">{format!("… {} more lines", total - limit)}</div> }.into_any());
+            }
+            out
+        }
+    };
+    let verb = match (&edit.before, &edit.after, proposed) {
+        (None, Some(_), false) => "Created",
+        (Some(_), None, false) => "Deleted",
+        (_, _, false) => "Edited",
+        (None, Some(_), true) => "Will create",
+        (Some(_), None, true) => "Will delete",
+        (_, _, true) => "Will edit",
     };
     let undoable = Memo::new(move |_| {
         let busy = ctx.live.with(|l| l.is_some());
-        !busy && can_undo(&current_session(&ctx).events, seq)
+        !proposed && !busy && can_undo(&current_session(&ctx).events, seq)
     });
     let path = edit.path.clone();
     let is_html = path.ends_with(".html") || path.ends_with(".htm");
@@ -210,18 +275,23 @@ pub fn diff_card(ctx: AppCtx, seq: u64, undone: bool, edit: FileEdit) -> AnyView
     };
     let has_after = edit.after.is_some() && !undone;
     view! {
-        <div class="diff" class:is-undone=undone>
+        <div class="diff" class:is-undone=undone class:is-proposed=proposed class:is-delete=is_delete class:is-all=move || show_all.get()>
             <div class="diff-head">
                 <span class="diff-verb">{verb}</span>
                 <span class="diff-path">{path.clone()}</span>
-                <span class="diff-stat"><span class="add">"+" {add}</span> <span class="del">"−" {del}</span></span>
+                <span class="diff-stat"><span class="add" class:is-zero=add == 0>"+" {add}</span> <span class="del" class:is-zero=del == 0>"−" {del}</span></span>
             </div>
-            <div class="diff-body">{rows}{more}</div>
+            <div class="diff-body">{rows}</div>
+            {move || (proposed && !is_delete && !show_all.get() && total > PROPOSED_ROWS).then(|| view! {
+                <button class="show-all" on:click=move |_| show_all.set(true)>{format!("Show all · {} more lines", total - PROPOSED_ROWS)}</button>
+            })}
             <div class="diff-foot">
                 {has_after.then(|| view! {
                     <button class="mini-btn" on:click=open_artifact.clone()>{if is_html { "Preview" } else { "Open" }}</button>
                 })}
-                {move || if undone {
+                {move || if proposed {
+                    view! { <span class="diff-undone">"Not applied yet"</span> }.into_any()
+                } else if undone {
                     view! { <span class="diff-undone">"Undone"</span> }.into_any()
                 } else if undoable.get() {
                     view! { <button class="mini-btn undo-btn" on:click=move |_| agent::undo(&ctx, seq)>"↶ Undo edit"</button> }.into_any()

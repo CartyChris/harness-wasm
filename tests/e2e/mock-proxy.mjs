@@ -8,7 +8,11 @@
 //                       step 2: edit_file(index.html)   step 3: summary
 //   "slow story"      → ~12 s of slow tokens (pause / cancel / reload tests)
 //   resume note       → continuation text
+//   "bulk files"      → 5 steps, each write_file of ~190 KB (storage quota test)
+//   "delete index"    → delete_file(index.html) (delete preview on the card)
 //   anything else     → a Markdown-rich answer (list, table, code)
+// Auth: like the real proxy, /api/chat answers 401 unless the bearer is
+// "demo-token" (the e2e profile's token).
 
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
@@ -50,11 +54,12 @@ function words(text) {
   return text.match(/\S+\s*|\s+/g) || [];
 }
 
-function toolCallFrames(id, name, argsObj) {
+function toolCallFrames(id, name, argsObj, step) {
   const args = JSON.stringify(argsObj);
+  const size = step || 60;
   const frames = [chunk({ tool_calls: [{ index: 0, id: id, type: 'function', function: { name: name, arguments: '' } }] })];
-  for (let i = 0; i < args.length; i += 60) {
-    frames.push(chunk({ tool_calls: [{ index: 0, function: { arguments: args.slice(i, i + 60) } }] }));
+  for (let i = 0; i < args.length; i += size) {
+    frames.push(chunk({ tool_calls: [{ index: 0, function: { arguments: args.slice(i, i + size) } }] }));
   }
   frames.push(chunk({}, 'tool_calls'));
   return frames;
@@ -81,6 +86,10 @@ function scenario(body) {
   const users = msgs.filter(function (m) { return m.role === 'user'; });
   const lastUser = users.length ? String(users[users.length - 1].content || '') : '';
   const toolMsgs = msgs.filter(function (m) { return m.role === 'tool'; });
+  // Tool results since the last user message (this turn only).
+  let lastUserIdx = -1;
+  msgs.forEach(function (m, i) { if (m.role === 'user') lastUserIdx = i; });
+  const turnTools = msgs.slice(lastUserIdx + 1).filter(function (m) { return m.role === 'tool'; });
   const lastMsg = msgs[msgs.length - 1] || {};
   const lower = lastUser.toLowerCase();
   if (lastMsg.role === 'user' && lastUser.indexOf(RESUME_NOTE) === 0) {
@@ -96,6 +105,21 @@ function scenario(body) {
     }
     const summary = 'Done. **index.html** is a single-file tip calculator:\n\n- Bill and tip % inputs (16px, no iOS zoom)\n- Live total as you type\n- Default tip bumped to 20%\n\nTap **Preview** on the diff card to try it.';
     return { delay: 30, frames: words(summary).map(function (w) { return chunk({ content: w }); }) };
+  }
+  if (lower.indexOf('bulk files') >= 0) {
+    if (toolMsgs.length < 5) {
+      const n = toolMsgs.length + 1;
+      const line = 'const row' + n + ' = "' + 'x'.repeat(80) + '";\n';
+      const content = line.repeat(Math.floor(190000 / line.length));
+      return { delay: 0, frames: toolCallFrames('call_bulk_' + n + '_' + Date.now(), 'write_file', { path: 'data/part' + n + '.js', content: content }, 20000) };
+    }
+    return { delay: 10, frames: words('Wrote five ~190 KB files.').map(function (w) { return chunk({ content: w }); }) };
+  }
+  if (lower.indexOf('delete index') >= 0 && turnTools.length === 0) {
+    return { delay: 30, frames: toolCallFrames('call_del_1', 'delete_file', { path: 'index.html' }) };
+  }
+  if (lower.indexOf('delete index') >= 0) {
+    return { delay: 20, frames: words('Okay — I left index.html in place.').map(function (w) { return chunk({ content: w }); }) };
   }
   if (lower.indexOf('slow story') >= 0) {
     return { delay: 140, frames: words(STORY).map(function (w) { return chunk({ content: w }); }) };
@@ -134,6 +158,11 @@ export function startMock(port, htmlPath) {
         let body = {};
         try { body = JSON.parse(raw); } catch (e) { body = {}; }
         requests.push({ body: body, auth: req.headers.authorization || '' });
+        if ((req.headers.authorization || '') !== 'Bearer demo-token') {
+          res.writeHead(401, Object.assign({ 'Content-Type': 'application/json' }, cors));
+          res.end('{"error":"missing or wrong access token"}');
+          return;
+        }
         const plan = scenario(body);
         res.writeHead(200, Object.assign({ 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache' }, cors));
         let i = 0;

@@ -71,6 +71,8 @@ pub struct AppCtx {
     pub expanded: RwSignal<BTreeSet<String>>,
     /// Thread is scrolled to (near) the bottom: new tokens keep it there.
     pub pinned: RwSignal<bool>,
+    /// Short confirmation ("Copied") shown over the composer.
+    pub toast: RwSignal<Option<String>>,
     pub transcript: Memo<Vec<TranscriptItem>>,
 }
 
@@ -107,11 +109,12 @@ impl AppCtx {
             log_open: RwSignal::new(false),
             mode_menu_open: RwSignal::new(false),
             artifact: RwSignal::new(None),
-            storage_error: RwSignal::new(None),
+            storage_error: RwSignal::new(boot.storage_error),
             notes: RwSignal::new(boot.notes),
             draft: RwSignal::new(String::new()),
             expanded: RwSignal::new(BTreeSet::new()),
             pinned: RwSignal::new(true),
+            toast: RwSignal::new(None),
             transcript,
         }
     }
@@ -173,4 +176,17 @@ pub fn append_event(ctx: &AppCtx, session_id: &str, kind: EventKind) -> u64 {
     });
     storage::save_sessions(ctx);
     seq
+}
+
+/// Show a toast for ~1.6 s (a newer toast replaces an older one).
+pub fn show_toast(ctx: &AppCtx, msg: &str) {
+    ctx.toast.set(Some(msg.to_string()));
+    let toast = ctx.toast;
+    let msg = msg.to_string();
+    let cb = wasm_bindgen::closure::Closure::once_into_js(move || {
+        if toast.get_untracked().as_deref() == Some(msg.as_str()) {
+            toast.set(None);
+        }
+    });
+    let _ = crate::js::window().set_timeout_with_callback_and_timeout_and_arguments_0(wasm_bindgen::JsCast::unchecked_ref(&cb), 1600);
 }

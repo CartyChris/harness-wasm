@@ -88,12 +88,14 @@ pub fn code_card(ctx: AppCtx, lang: String, body: String, closed: bool) -> AnyVi
         Artifact::Code { lang: lang.clone(), body: body.clone() }
     };
     let open_label = if is_html { "Preview" } else { "Open" };
+    let copy_body = body.clone();
     let meta = if closed { format!("{line_count} lines") } else { "writing…".to_string() };
     view! {
         <div class="codecard">
             <div class="codecard-head">
                 <span class="codecard-lang">{lang}</span>
                 <span class="codecard-meta">{meta}</span>
+                <button class="mini-btn code-copy" aria-label="Copy code" on:click=move |_| crate::js::copy_text(ctx, copy_body.clone())>"Copy"</button>
                 <button class="mini-btn" on:click=move |_| ctx.artifact.set(Some(artifact.clone()))>
                     {open_label}
                 </button>

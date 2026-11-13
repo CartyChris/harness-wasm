@@ -8,6 +8,8 @@ use leptos::prelude::*;
 #[component]
 pub fn ArtifactSheet(ctx: AppCtx, artifact: Artifact) -> impl IntoView {
     let show_source = RwSignal::new(false);
+    // Claude-style artifact view: the sheet can take the whole screen.
+    let full = RwSignal::new(false);
     let copied = RwSignal::new(None::<String>);
     let title = match &artifact {
         Artifact::Code { lang, .. } => format!("{lang} artifact"),
@@ -80,10 +82,18 @@ pub fn ArtifactSheet(ctx: AppCtx, artifact: Artifact) -> impl IntoView {
     view! {
         <div class="overlay" role="dialog" aria-modal="true" aria-label=title.clone()>
             <button class="overlay-backdrop" aria-label="Close artifact" on:click=close></button>
-            <section class="sheet artifact-sheet">
+            <section class="sheet artifact-sheet" class:is-full=move || full.get()>
                 <header class="sheet-head">
                     <h2>{title.clone()}</h2>
                     <div class="sheet-head-actions">
+                        <button
+                            class="mini-btn full-btn"
+                            aria-label=move || if full.get() { "Exit full screen" } else { "Open full screen" }
+                            aria-pressed=move || full.get().to_string()
+                            on:click=move |_| full.update(|v| *v = !*v)
+                        >
+                            <span class=move || if full.get() { "full-glyph is-exit" } else { "full-glyph" } aria-hidden="true"></span>
+                        </button>
                         <Show when=move || is_html>
                             <button class="mini-btn" on:click=move |_| toggle_source.update(|v| *v = !*v)>
                                 {source_label}

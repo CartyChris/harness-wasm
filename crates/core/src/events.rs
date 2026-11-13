@@ -258,6 +258,13 @@ fn edit_path(events: &[Event], seq: u64) -> Option<String> {
     })
 }
 
+fn edit_turn(events: &[Event], seq: u64) -> Option<&str> {
+    events.iter().find_map(|e| match &e.kind {
+        EventKind::ToolResult { turn, edit: Some(_), .. } if e.seq == seq => Some(turn.as_str()),
+        _ => None,
+    })
+}
+
 /// Project the model history from the log (DeepSeek `deriveMessages()`).
 pub fn derive_messages(events: &[Event]) -> Vec<WireMessage> {
     let excluded = excluded_turns(events);
@@ -321,6 +328,11 @@ pub fn derive_messages(events: &[Event]) -> Vec<WireMessage> {
                 }
             }
             EventKind::EditUndo { edit_seq } => {
+                // The model never saw edits from excluded (failed/regenerated)
+                // turns, so it must not be told they were undone.
+                if edit_turn(events, *edit_seq).is_some_and(|t| excluded.contains(t)) {
+                    continue;
+                }
                 if let Some(path) = edit_path(events, *edit_seq) {
                     out.push(WireMessage::text(
                         "user",
@@ -562,6 +574,42 @@ pub fn retryable_turn(events: &[Event]) -> Option<String> {
     })
 }
 
+/// The latest turn when it finished normally (Done / StepLimit) and nothing
+/// the user said came after it: the Claude-style "Regenerate" target.
+pub fn regenerable_turn(events: &[Event]) -> Option<String> {
+    let last_turn = events.iter().rev().find_map(|e| match &e.kind {
+        EventKind::TurnStart { turn, .. } => Some(turn.clone()),
+        _ => None,
+    })?;
+    let after_user = events
+        .iter()
+        .rev()
+        .take_while(|e| !matches!(&e.kind, EventKind::TurnStart { turn, .. } if *turn == last_turn))
+        .any(|e| matches!(e.kind, EventKind::UserMessage { .. }));
+    if after_user {
+        return None;
+    }
+    events.iter().rev().find_map(|e| match &e.kind {
+        EventKind::TurnEnd { turn, outcome: Outcome::Done | Outcome::StepLimit } if *turn == last_turn => Some(turn.clone()),
+        _ => None,
+    })
+}
+
+/// Seqs of the file edits a turn made that are still live, newest first:
+/// the undo order that returns the workspace to its pre-turn state.
+pub fn turn_live_edits(events: &[Event], turn_id: &str) -> Vec<u64> {
+    let undone = crate::workspace::undone_set(events);
+    let mut out: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ToolResult { turn, edit: Some(_), ok: true, .. } if turn == turn_id && !undone.contains(&e.seq) => Some(e.seq),
+            _ => None,
+        })
+        .collect();
+    out.reverse();
+    out
+}
+
 /// Convert a Stage 2 message list into an equivalent log (one-time
 /// migration on load). Each assistant message becomes its own settled turn.
 pub fn from_legacy(messages: &[Message], at: f64) -> Vec<Event> {
@@ -778,5 +826,31 @@ mod tests {
         let TranscriptItem::Turn(t) = &items[3] else { panic!() };
         assert!(matches!(t.status, TurnStatus::Interrupted { .. }));
         assert_eq!(open_turn(&log), None);
+    }
+
+    #[test]
+    fn regenerate_targets_latest_done_turn_and_reverts_its_edits() {
+        let mut log = tool_turn();
+        assert_eq!(regenerable_turn(&log).as_deref(), Some("t1"));
+        assert_eq!(retryable_turn(&log), None, "Done is regenerate, not retry");
+        let edits = turn_live_edits(&log, "t1");
+        assert_eq!(edits, vec![5], "only the write, not the read");
+        for seq in &edits {
+            assert!(crate::workspace::can_undo(&log, *seq));
+            append(&mut log, EventKind::EditUndo { edit_seq: *seq }, 0.0);
+        }
+        assert!(crate::workspace::Workspace::derive(&log).files.is_empty(), "workspace back to pre-turn");
+        let users_before = log.iter().filter(|e| matches!(e.kind, EventKind::UserMessage { .. })).count();
+        start(&mut log, "t2", Some("t1"));
+        let users_after = log.iter().filter(|e| matches!(e.kind, EventKind::UserMessage { .. })).count();
+        assert_eq!(users_before, users_after, "no duplicate user event");
+        let msgs = derive_messages(&log);
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user"], "old turn and its undo note are hidden from the model");
+        // A later user message makes it no longer regenerable.
+        append(&mut log, EventKind::TurnEnd { turn: "t2".into(), outcome: Outcome::Done }, 0.0);
+        assert_eq!(regenerable_turn(&log).as_deref(), Some("t2"));
+        append(&mut log, EventKind::UserMessage { id: "u2".into(), text: "more".into() }, 0.0);
+        assert_eq!(regenerable_turn(&log), None);
     }
 }

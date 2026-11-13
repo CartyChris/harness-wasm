@@ -12,7 +12,7 @@ use crate::state::{append_event, session_events, with_session, AppCtx, LiveTurn,
 use crate::storage;
 use harness_core::agent_loop::{next_action, LoopConfig, NextAction};
 use harness_core::context::{assemble, DEFAULT_BUDGET_TOKENS};
-use harness_core::events::{open_turn, retryable_turn, DecisionBy, EventKind, Outcome};
+use harness_core::events::{open_turn, regenerable_turn, retryable_turn, turn_live_edits, DecisionBy, EventKind, Outcome};
 use harness_core::permissions::{decide as policy, Permission};
 use harness_core::sse::ChunkDelta;
 use harness_core::tools::{self, ToolCallAccumulator};
@@ -118,6 +118,25 @@ pub fn retry(ctx: &AppCtx) {
     if let Some(old) = retryable_turn(&session_events(ctx, &session_id)) {
         start_turn(ctx, &session_id, Some(old));
     }
+}
+
+/// Claude-style Regenerate of the latest finished turn: its file edits are
+/// undone first (newest first, as `edit/undo` events) so the new attempt
+/// starts from the same workspace, then a fresh turn is started with
+/// `retry_of` — no new user event, the old attempt drops out of history.
+pub fn regenerate(ctx: &AppCtx) {
+    if ctx.live.get_untracked().is_some() {
+        return;
+    }
+    let session_id = ctx.current_id.get_untracked();
+    let events = session_events(ctx, &session_id);
+    let Some(old) = regenerable_turn(&events) else { return };
+    for seq in turn_live_edits(&events, &old) {
+        if can_undo(&session_events(ctx, &session_id), seq) {
+            append_event(ctx, &session_id, EventKind::EditUndo { edit_seq: seq });
+        }
+    }
+    start_turn(ctx, &session_id, Some(old));
 }
 
 /// The user's answer on an approval card.
@@ -334,6 +353,9 @@ async fn stream_step(ctx: &AppCtx, session_id: &str, turn: &str, step: u32) -> b
     // goose: a page teardown is a pause, never a failure — the turn stays
     // open and resumable after reload.
     if crate::js::page_hiding() && !matches!(result, Ok(NetOutcome::Done)) {
+        // Synchronous net first: the IndexedDB commit below is async and may
+        // not land before teardown; boot recovers from this checkpoint.
+        storage::save_live_checkpoint(session_id, turn, step, &text);
         settle_partial(ctx, &text);
         append_event(ctx, session_id, EventKind::TurnPause { turn: turn.to_string(), reason: "page reloaded".into() });
         ctx.live.set(None);

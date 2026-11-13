@@ -1,9 +1,11 @@
 pub mod agent_loop;
 pub mod context;
 pub mod events;
+pub mod export;
 pub mod markdown;
 pub mod model;
 pub mod permissions;
+pub mod secrets;
 pub mod sse;
 pub mod tools;
 pub mod types;

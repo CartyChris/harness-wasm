@@ -4,9 +4,10 @@
 
 use crate::agent;
 use crate::state::{current_session, AppCtx, LiveTurn, Phase};
+use crate::js;
 use crate::ui::md::render_markdown;
 use crate::ui::timeline::tool_card;
-use harness_core::events::{retryable_turn, StepItem, TranscriptItem, TurnStatus, TurnView};
+use harness_core::events::{regenerable_turn, retryable_turn, StepItem, TranscriptItem, TurnStatus, TurnView};
 use leptos::prelude::*;
 
 const SUGGESTIONS: [(&str, &str); 4] = [
@@ -155,11 +156,39 @@ fn turn_view(ctx: AppCtx, turn: TurnView) -> AnyView {
         let turn_id = turn_id.clone();
         Memo::new(move |_| ctx.live.with(|l| l.is_none()) && retryable_turn(&current_session(&ctx).events).as_deref() == Some(turn_id.as_str()))
     };
+    let can_regen = {
+        let turn_id = turn_id.clone();
+        Memo::new(move |_| ctx.live.with(|l| l.is_none()) && regenerable_turn(&current_session(&ctx).events).as_deref() == Some(turn_id.as_str()))
+    };
+    // Copy = the reply text the user sees (tool cards excluded).
+    let reply_text = turn
+        .items
+        .iter()
+        .filter_map(|i| if let StepItem::Text { text, .. } = i { Some(text.trim()) } else { None })
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let copy_src = (!reply_text.is_empty()).then_some(reply_text);
+    let copy_btn = move || {
+        copy_src.clone().map(|text| view! {
+            <button class="foot-btn copy-btn" aria-label="Copy reply" on:click=move |_| js::copy_text(ctx, text.clone())>
+                <span class="copy-glyph" aria-hidden="true"></span><span>"Copy"</span>
+            </button>
+        })
+    };
     let retry_btn = move || {
         can_retry.get().then(|| view! {
             <button class="mini-btn retry-btn" on:click=move |_| agent::retry(&ctx)>"↻ Retry"</button>
         })
     };
+    let regen_btn = move || {
+        can_regen.get().then(|| view! {
+            <button class="foot-btn regen-btn" aria-label="Regenerate reply" on:click=move |_| agent::regenerate(&ctx)>
+                <span aria-hidden="true">"↻"</span><span>"Regenerate"</span>
+            </button>
+        })
+    };
+    let actions = move || view! { <div class="turn-actions">{copy_btn()}{regen_btn}</div> };
     let model_short = turn.model.rsplit('/').next().unwrap_or(&turn.model).to_string();
     let tools_n = turn.tool_count();
     let meta = {
@@ -178,14 +207,14 @@ fn turn_view(ctx: AppCtx, turn: TurnView) -> AnyView {
         TurnStatus::Running => ().into_any(),
         TurnStatus::Paused { reason } => view! {
             <div class="turn-foot">
-                <div class="turn-status is-paused"><span class="pause-glyph" aria-hidden="true"></span>{format!("Paused · {reason}")}</div>
-                <button class="mini-btn resume-btn" on:click=move |_| agent::resume(&ctx)>"▶ Resume"</button>
+                <div class="turn-status is-paused"><span class="pause-glyph" aria-hidden="true"></span>{format!("Paused · {reason}")}<span class="turn-hint">" — tap Resume below"</span></div>
             </div>
         }
         .into_any(),
         TurnStatus::Done => view! {
             <div class="turn-foot">
                 {empty_done.then(|| view! { <div class="turn-status">"(no reply text)"</div> })}
+                {actions}
                 <div class="turn-meta">{meta.clone()}</div>
             </div>
         }
@@ -194,6 +223,7 @@ fn turn_view(ctx: AppCtx, turn: TurnView) -> AnyView {
             <div class="turn-foot">
                 <div class="turn-status is-warn">"Stopped — partial reply kept."</div>
                 {retry_btn}
+                {actions}
             </div>
         }
         .into_any(),
@@ -214,6 +244,7 @@ fn turn_view(ctx: AppCtx, turn: TurnView) -> AnyView {
         TurnStatus::StepLimit => view! {
             <div class="turn-foot">
                 <div class="turn-status is-warn">"Stopped at the step limit. Send a message to keep going."</div>
+                {actions}
                 <div class="turn-meta">{meta.clone()}</div>
             </div>
         }
